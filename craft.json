@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "retroamp",
+  "request": "Build RetroAmp: a modular retro multimedia player for Linux in Rust with classic Winamp skins, alternative UI/UX themes, and modern audio engine",
+  "target": "/home/rizky/Downloads/winamp_latest_full.exe",
+  "stack": "rust-desktop",
+  "created_at": 1730906000,
+  "updated_at": 1730906000,
+  "app_in_root": true,
+  "builder": "zcode",
+  "status": "in_progress",
+  "allowed_actions": [
+    "all"
+  ]
+}

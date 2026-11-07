@@ -1,0 +1,25 @@
+[package]
+name = "retroamp"
+version = "0.1.0"
+edition = "2024"
+authors = ["RetroAmp Linux Contributors"]
+description = "RetroAmp: modular retro multimedia player for Linux in Rust"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
+egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-flac", "symphonia-wav", "symphonia-vorbis", "symphonia-aac"] }
+symphonia = { version = "0.5", features = ["all"] }
+rustfft = "6.4"
+rfd = "0.15"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+fastrand = "2.3"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[build-dependencies]
