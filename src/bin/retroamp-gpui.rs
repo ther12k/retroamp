@@ -5,6 +5,8 @@ use gpui::{
 };
 use retroamp::audio::{AudioEngine, PlaybackState};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 actions!(
@@ -70,6 +72,9 @@ struct Player {
     focus: FocusHandle,
     ticks: Option<Task<()>>,
     picking: bool,
+    loading: bool,
+    load_generation: u64,
+    load_cancel: Option<Arc<AtomicBool>>,
     error: Option<String>,
 }
 
@@ -87,24 +92,83 @@ impl Player {
             focus,
             ticks: None,
             picking: false,
+            loading: false,
+            load_generation: 0,
+            load_cancel: None,
             error: None,
         };
         if !player.queue.files.is_empty() {
-            player.start(0);
-            player.sync_ticks(cx);
+            player.start(0, cx, false);
         }
         player
     }
 
-    fn start(&mut self, index: usize) {
-        if let Some(path) = self.queue.select(index) {
-            self.error = self
-                .audio
-                .play_file(path)
-                .err()
-                .map(|e| format!("Can't play file: {e}"));
-            self.scroll.scroll_to_item(index, ScrollStrategy::Center);
+    fn invalidate_load(&mut self) {
+        self.load_generation = self.load_generation.wrapping_add(1);
+        if let Some(cancel) = self.load_cancel.take() {
+            cancel.store(true, Ordering::SeqCst);
         }
+        self.loading = false;
+    }
+
+    fn start(&mut self, index: usize, cx: &mut Context<Self>, auto_advance: bool) {
+        let Some(path) = self.queue.select(index).map(Path::to_path_buf) else {
+            return;
+        };
+
+        self.invalidate_load();
+        let generation = self.load_generation;
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let mut loading_audio = std::mem::replace(&mut self.audio, AudioEngine::new());
+        let mut standby_audio = AudioEngine::new();
+        standby_audio.set_volume(loading_audio.volume);
+        standby_audio.set_balance(loading_audio.balance);
+        standby_audio.update_eq(loading_audio.eq);
+        self.audio = standby_audio;
+        self.loading = true;
+        self.load_cancel = Some(cancellation);
+        self.error = None;
+        self.scroll.scroll_to_item(index, ScrollStrategy::Center);
+        cx.notify();
+
+        let worker_path = path.clone();
+        let background = cx.background_executor().spawn(async move {
+            let result =
+                loading_audio.play_file_with_cancellation(&worker_path, &worker_cancellation);
+            (loading_audio, result)
+        });
+
+        cx.spawn(async move |this, cx| {
+            let (mut loaded_audio, result) = background.await;
+            let _ = this.update(cx, move |player, cx| {
+                if player.load_generation != generation {
+                    return;
+                }
+                player.loading = false;
+                player.load_cancel = None;
+
+                match result {
+                    Ok(()) => {
+                        loaded_audio.set_volume(player.audio.volume);
+                        loaded_audio.set_balance(player.audio.balance);
+                        loaded_audio.update_eq(player.audio.eq);
+                        player.audio = loaded_audio;
+                        player.error = None;
+                    }
+                    Err(error) => {
+                        player.error = Some(format!("Can't play {}: {error}", file_name(&path)));
+                        if auto_advance && let Some(next) = player.queue.neighbor(1) {
+                            player.start(next, cx, true);
+                        }
+                    }
+                }
+
+                player.sync_ticks(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     // Poll EOF independently of drawing so the queue advances in a minimized window.
@@ -118,7 +182,7 @@ impl Player {
                         if player.audio.update()
                             && let Some(next) = player.queue.neighbor(1)
                         {
-                            player.start(next);
+                            player.start(next, cx, true);
                         }
                         cx.notify();
                         player.audio.is_playing()
@@ -153,8 +217,7 @@ impl Player {
                             files,
                             current: None,
                         };
-                        player.start(0);
-                        player.sync_ticks(cx);
+                        player.start(0, cx, false);
                     }
                     Ok(Err(e)) => player.error = Some(format!("Can't open file picker: {e}")),
                     Err(_) => {
@@ -170,11 +233,14 @@ impl Player {
     }
 
     fn play(&mut self, cx: &mut Context<Self>) {
+        if self.loading {
+            return;
+        }
         match self.audio.state {
             PlaybackState::Playing => return,
             PlaybackState::Paused => self.audio.resume(),
             PlaybackState::Stopped => match self.queue.current {
-                Some(i) => self.start(i),
+                Some(i) => self.start(i, cx, false),
                 None => return self.open(cx),
             },
         }
@@ -183,17 +249,23 @@ impl Player {
     }
 
     fn control(&mut self, control: Control, cx: &mut Context<Self>) {
+        if self.loading && control == Control::PlayPause {
+            return;
+        }
         match control {
             Control::Open => return self.open(cx),
             Control::PlayPause => match self.audio.state {
                 PlaybackState::Playing => self.audio.pause(),
                 PlaybackState::Paused => self.audio.resume(),
                 PlaybackState::Stopped => match self.queue.current {
-                    Some(i) => self.start(i),
+                    Some(i) => self.start(i, cx, false),
                     None => return self.open(cx),
                 },
             },
-            Control::Stop => self.audio.stop(),
+            Control::Stop => {
+                self.invalidate_load();
+                self.audio.stop();
+            }
             Control::Previous | Control::Next => {
                 let offset = if matches!(control, Control::Previous) {
                     -1
@@ -201,7 +273,7 @@ impl Player {
                     1
                 };
                 if let Some(i) = self.queue.neighbor(offset) {
-                    self.start(i);
+                    self.start(i, cx, false);
                 }
             }
         }
@@ -253,6 +325,14 @@ impl Player {
     }
 }
 
+impl Drop for Player {
+    fn drop(&mut self) {
+        if let Some(cancel) = &self.load_cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or(path.as_os_str())
@@ -277,10 +357,14 @@ impl Render for Player {
             .map(|t| t.title.clone())
             .or_else(|| selected.map(|p| file_name(p)))
             .unwrap_or_else(|| "No track loaded".into());
-        let (state, state_color) = match self.audio.state {
-            PlaybackState::Playing => ("PLAYING", PHOSPHOR),
-            PlaybackState::Paused => ("PAUSED", 0xffd28a),
-            PlaybackState::Stopped => ("STOPPED", MUTED),
+        let (state, state_color) = if self.loading {
+            ("LOADING", 0xffd28a)
+        } else {
+            match self.audio.state {
+                PlaybackState::Playing => ("PLAYING", PHOSPHOR),
+                PlaybackState::Paused => ("PAUSED", 0xffd28a),
+                PlaybackState::Stopped => ("STOPPED", MUTED),
+            }
         };
         let artist = track
             .map(|t| t.artist.clone())
@@ -288,10 +372,14 @@ impl Render for Player {
         let duration = track
             .map(|t| clock(t.duration))
             .unwrap_or_else(|| "--:--".into());
-        let play_label = match self.audio.state {
-            PlaybackState::Playing => "Pause",
-            PlaybackState::Paused => "Resume",
-            PlaybackState::Stopped => "Play",
+        let play_label = if self.loading {
+            "Loading…"
+        } else {
+            match self.audio.state {
+                PlaybackState::Playing => "Pause",
+                PlaybackState::Paused => "Resume",
+                PlaybackState::Stopped => "Play",
+            }
         };
         let (_, spectrum, _) = self.audio.get_vis_data();
         let count = self.queue.files.len();
@@ -398,12 +486,19 @@ impl Render for Player {
                         false,
                         cx,
                     ))
-                    .child(self.button("play", play_label, Control::PlayPause, count > 0, true, cx))
+                    .child(self.button(
+                        "play",
+                        play_label,
+                        Control::PlayPause,
+                        count > 0 && !self.loading,
+                        true,
+                        cx,
+                    ))
                     .child(self.button(
                         "stop",
                         "Stop",
                         Control::Stop,
-                        self.audio.state != PlaybackState::Stopped,
+                        self.loading || self.audio.state != PlaybackState::Stopped,
                         false,
                         cx,
                     ))
@@ -475,9 +570,7 @@ impl Render for Player {
                                             div().truncate().child(file_name(&this.queue.files[i])),
                                         )
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.start(i);
-                                            this.sync_ticks(cx);
-                                            cx.notify();
+                                            this.start(i, cx, false);
                                         }))
                                 })
                                 .collect()
