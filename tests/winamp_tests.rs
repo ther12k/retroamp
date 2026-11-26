@@ -1,7 +1,10 @@
+#[cfg(feature = "egui-ui")]
 use std::path::Path;
 use retroamp::audio::{AudioEngine, BiquadFilter, PlaybackState};
+#[cfg(feature = "egui-ui")]
 use retroamp::skin::Skin;
 
+#[cfg(feature = "egui-ui")]
 #[test]
 fn test_embedded_skin_loads() {
     let skin = Skin::load_default();
@@ -17,6 +20,7 @@ fn test_embedded_skin_loads() {
     assert_eq!(skin.vis_colors.len(), 24);
 }
 
+#[cfg(feature = "egui-ui")]
 #[test]
 fn test_skin_loader_safety_and_validation() {
     // 1. Loading non-existent file must return Err
@@ -67,44 +71,36 @@ fn test_biquad_eq_dsp_processing() {
 }
 
 #[test]
+#[ignore = "requires audio output and a RETROAMP_TEST_AUDIO fixture with an audible opening"]
 fn test_audio_playback_and_fft() {
+    use std::time::{Duration, Instant};
+
+    let path = std::env::var_os("RETROAMP_TEST_AUDIO").expect("set RETROAMP_TEST_AUDIO");
     let mut audio = AudioEngine::new();
-    let mp3_path = Path::new("/mnt/data/The WIRED CD - Rip. Sample. Mash. Share/01 - Beastie Boys - Now Get Busy.mp3");
+    audio.play_file(std::path::PathBuf::from(path)).expect("Failed to play fixture");
+    assert!(audio.is_playing());
 
-    if mp3_path.exists() {
-        audio.play_file(mp3_path).expect("Failed to play MP3");
-        assert!(audio.is_playing());
-        assert!(audio.current_track.is_some());
+    let track = audio.current_track.as_ref().unwrap();
+    assert!(track.sample_rate > 0 && track.channels > 0 && !track.duration.is_zero());
+    let seek_to = track.duration / 2;
 
-        let track = audio.current_track.as_ref().unwrap();
-        assert_eq!(track.sample_rate, 44100);
-        assert_eq!(track.channels, 2);
-        assert!(track.duration.as_secs() > 0);
-
-        // Let audio stream run for 400ms to verify FFT and visualization buffer
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let finished = audio.update();
-        assert!(!finished, "Song should not finish immediately");
-
-        let (_waveform, spectrum, _peaks) = audio.get_vis_data();
-        let total_energy: f32 = spectrum.iter().sum();
-
-        assert!(
-            total_energy > 0.01,
-            "FFT spectrum energy should be non-zero during playback"
-        );
-
-        // Test seeking
-        audio.seek(std::time::Duration::from_secs(10));
-        assert_eq!(audio.position.as_secs(), 10);
-
-        audio.pause();
-        assert_eq!(audio.state, PlaybackState::Paused);
-
-        audio.resume();
-        assert_eq!(audio.state, PlaybackState::Playing);
-
-        audio.stop();
-        assert_eq!(audio.state, PlaybackState::Stopped);
+    // Output backends need not deliver the first decoded buffer at the same latency.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!audio.update(), "Fixture ended before producing FFT data");
+        if audio.get_vis_data().1.iter().sum::<f32>() > 0.01 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "No FFT energy within five seconds");
     }
+
+    audio.seek(seek_to);
+    assert_eq!(audio.position, seek_to);
+    audio.pause();
+    assert_eq!(audio.state, PlaybackState::Paused);
+    audio.resume();
+    assert_eq!(audio.state, PlaybackState::Playing);
+    audio.stop();
+    assert_eq!(audio.state, PlaybackState::Stopped);
 }

@@ -57,6 +57,22 @@
 
 ---
 
+## GPUI experiment (Linux)
+
+This branch has two frontends. A normal `cargo run --locked` still starts the egui player. To try the GPUI player instead, from this checkout:
+
+```bash
+cargo run --locked --no-default-features --features gpui-ui --bin retroamp-gpui
+# Or start with a playlist:
+cargo run --locked --no-default-features --features gpui-ui --bin retroamp-gpui -- track1.flac track2.mp3
+```
+
+Use a Linux desktop with a working Vulkan presentation surface and audio output. Keep `--locked`: GPUI 0.2.2 pulls in `xattr` 0.2.3, which uses a Linux symbol removed in libc 0.2.190. The lockfile selects a compatible libc/mio pair.
+
+**Open…** (`L` or `Ctrl+O`) replaces the queue with the selected audio files. Click a row to play it, or use Previous / Play / Pause / Stop / Next. `Z` / `X` / `C` / `V` / `B` control previous / play / pause-resume / stop / next; Up/Down adjusts volume. Tab/Shift+Tab moves focus, and Enter or Space activates a focused control. The GPUI target uses the same `AudioEngine` as the egui target, draws its own controls, and does not compile RetroAmp's bitmap skin loader. It does not yet implement the skinned windows, EQ editor, or saved preferences. The classic assets remain in this repository; binary distribution remains paused.
+
+The GPUI view renders only the visible playlist rows and polls the audio engine about 30 times per second during playback, not at idle. The earlier idle comparison was made before egui's repaint policy was updated, so its numbers are stale. Compare release builds with the same track, controls, and update rate before attributing a difference to the toolkit.
+
 ## 🚀 Running RetroAmp
 
 ### From App Launcher
