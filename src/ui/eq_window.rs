@@ -12,6 +12,9 @@ pub struct EqWindowState {
     pub active_slider: Option<usize>, // 0: Preamp, 1..=10: Bands
     /// Preset picker popup (shared by every theme's EQ renderer).
     pub show_presets: bool,
+    /// Frames since the preset popup opened — outside-click close is ignored
+    /// for the first frames so the opening click can't dismiss it again.
+    pub presets_frames: u32,
 }
 
 impl Default for EqWindowState {
@@ -22,6 +25,7 @@ impl Default for EqWindowState {
             drag_offset: Vec2::ZERO,
             active_slider: None,
             show_presets: false,
+            presets_frames: 0,
         }
     }
 }
@@ -120,6 +124,7 @@ pub fn render_eq_window(
     );
     if presets_resp.clicked() {
         state.show_presets = !state.show_presets;
+        state.presets_frames = 0;
     }
 
     // 4. Equalizer Graph (x: 86, y: 17, 113x19)

@@ -15,6 +15,10 @@ pub struct PlaylistEntry {
 pub struct PlaylistWindowState {
     pub position: Pos2,
     pub height: f32,
+    /// Unsnapped drag height (source of truth while resizing). Keeping the
+    /// fractional remainder is what makes slow drags accumulate: rounding
+    /// `height` every frame throws sub-row deltas away.
+    pub height_unsnapped: f32,
     pub selected_index: Option<usize>,
     pub scroll_offset: usize,
     pub items: Vec<PlaylistEntry>,
@@ -27,11 +31,28 @@ impl Default for PlaylistWindowState {
         Self {
             position: Pos2::new(10.0, 242.0), // docked below EQ (126 + 116 = 242)
             height: PL_DEFAULT_HEIGHT,
+            height_unsnapped: PL_DEFAULT_HEIGHT,
             selected_index: None,
             scroll_offset: 0,
             items: Vec::new(),
             is_dragging: false,
             drag_offset: Vec2::ZERO,
+        }
+    }
+}
+
+impl PlaylistWindowState {
+    pub(super) fn resize_from_grip(&mut self, grip: &egui::Response, row_height: f32) {
+        grip.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
+        if grip.drag_started() {
+            self.height_unsnapped = self.height;
+        }
+        if grip.dragged() {
+            const CHROME: f32 = 58.0;
+            self.height_unsnapped = (self.height_unsnapped + grip.drag_delta().y)
+                .clamp(CHROME + 2.0 * row_height, CHROME + 64.0 * row_height);
+            let rows = ((self.height_unsnapped - CHROME) / row_height).round();
+            self.height = CHROME + rows * row_height;
         }
     }
 }
@@ -215,9 +236,27 @@ pub fn render_playlist_window(
 
         if is_selected {
             painter.rect_filled(item_rect, 0.0, Color32::from_rgb(0, 0, 140));
+        } else if is_playing {
+            painter.rect_filled(item_rect, 0.0, Color32::from_rgb(0, 48, 16));
         }
 
         let item_resp = ui.allocate_rect(item_rect, Sense::click());
+        item_resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                is_selected,
+                &entry.title,
+            )
+        });
+        if item_resp.has_focus() {
+            painter.rect_stroke(
+                item_rect.shrink(0.5),
+                0.0,
+                egui::Stroke::new(1.0_f32, Color32::YELLOW),
+                egui::StrokeKind::Inside,
+            );
+        }
         if item_resp.clicked() {
             state.selected_index = Some(entry_idx);
         }
@@ -229,13 +268,14 @@ pub fn render_playlist_window(
         let line_text = format!("{}. {}", entry_idx + 1, entry.title);
         let dur_text = format!("{:02}:{:02}", entry.duration_secs / 60, entry.duration_secs % 60);
 
-        // Render with Winamp font
-        let _text_color = if is_playing {
-            Color32::from_rgb(0, 255, 64)
-        } else if is_selected {
+        // Render with Winamp font. The green row tint is a second cue for
+        // playback; selection remains blue and is never encoded by text color.
+        let text_tint = if is_selected {
             Color32::WHITE
+        } else if is_playing {
+            Color32::from_rgb(160, 255, 176)
         } else {
-            Color32::from_rgb(0, 200, 0)
+            Color32::WHITE
         };
 
         let mut x = item_rect.min.x + 2.0;
@@ -246,7 +286,7 @@ pub fn render_playlist_window(
             } else {
                 Sprites::char_rect(ch)
             };
-            painter.image(textures.text.id(), ch_rect, sprite.to_uv(155.0, 74.0), Color32::WHITE);
+            painter.image(textures.text.id(), ch_rect, sprite.to_uv(155.0, 74.0), text_tint);
             x += 5.0;
         }
 
@@ -258,7 +298,7 @@ pub fn render_playlist_window(
             } else {
                 Sprites::char_rect(ch)
             };
-            painter.image(textures.text.id(), ch_rect, sprite.to_uv(155.0, 74.0), Color32::WHITE);
+            painter.image(textures.text.id(), ch_rect, sprite.to_uv(155.0, 74.0), text_tint);
             dur_x += 5.0;
         }
     }
@@ -270,19 +310,9 @@ pub fn render_playlist_window(
             state.position + Vec2::new(13.0, state.height - 7.0),
             state.position + Vec2::new(PL_DEFAULT_WIDTH - 21.0, state.height),
         );
-        let grip_resp = ui.allocate_rect(grip_rect, Sense::drag());
-        grip_resp.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
-
-        // Smooth resize: accumulate *relative* pointer movement and snap the
-        // running total to row increments. (Absolute pointer math jitters,
-        // because the host window resizes underneath the cursor mid-drag.)
-        if grip_resp.dragged() {
-            const CHROME: f32 = 58.0;
-            const ROW_H: f32 = 13.0;
-            let rows = ((state.height - CHROME) / ROW_H).round();
-            let new_rows = (rows + grip_resp.drag_delta().y / ROW_H).clamp(2.0, 64.0);
-            state.height = CHROME + new_rows * ROW_H;
-        }
+        let grip_id = ui.make_persistent_id("playlist-resize-grip");
+        let grip_resp = ui.interact(grip_rect, grip_id, Sense::drag());
+        state.resize_from_grip(&grip_resp, 13.0);
     }
 
     // 4. Bottom Action Buttons (+ ADD, - REM, SEL, MISC)

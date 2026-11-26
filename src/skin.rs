@@ -8,8 +8,15 @@
 
 use egui::{Color32, ColorImage, Rect, Pos2, Vec2};
 use std::collections::HashMap;
-use std::io::Read as _;
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
+
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ARCHIVE_ENTRIES: usize = 128;
+const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TOTAL_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 2048;
+const MAX_IMAGE_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const MAIN_WIDTH: f32 = 275.0;
 pub const MAIN_HEIGHT: f32 = 116.0;
@@ -34,6 +41,7 @@ const RAW_EQMAIN: &[u8] = include_bytes!("../assets/skins/default/eqmain.png");
 const RAW_EQ_EX: &[u8] = include_bytes!("../assets/skins/default/eq_ex.png");
 const RAW_PLEDIT: &[u8] = include_bytes!("../assets/skins/default/pledit.png");
 const RAW_VISCOLOR: &str = include_str!("../assets/skins/default/viscolor.txt");
+const RAW_NORD_FROST: &[u8] = include_bytes!("../assets/skins/nord_frost.wsz");
 
 #[derive(Clone)]
 pub struct Skin {
@@ -78,7 +86,7 @@ impl Skin {
         }
     }
 
-    /// Load a skin from a .wsz or .zip archive file safely.
+    /// Load a skin from a .wsz or .zip archive file with bounded reads.
     pub fn load_wsz<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let path_ref = path.as_ref();
         let name = path_ref
@@ -86,93 +94,170 @@ impl Skin {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Custom Skin".to_string());
 
-        let file = std::fs::File::open(path_ref).map_err(|e| e.to_string())?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        let file = std::fs::File::open(path_ref).map_err(|error| error.to_string())?;
+        if file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_ARCHIVE_BYTES
+        {
+            return Err("Skin archive exceeds the size limit".to_string());
+        }
+        Self::load_archive(name, file)
+    }
 
+    /// Load the bundled Nord Frost skin from the executable's embedded bytes.
+    pub fn load_nord_frost() -> Result<Self, String> {
+        Self::load_archive("nord_frost".to_string(), Cursor::new(RAW_NORD_FROST))
+    }
+
+    fn load_archive<R: Read + Seek>(name: String, reader: R) -> Result<Self, String> {
         const KNOWN_ASSETS: &[&str] = &[
-            "MAIN.BMP", "CBUTTONS.BMP", "TITLEBAR.BMP", "NUMBERS.BMP", "TEXT.BMP",
-            "VOLUME.BMP", "BALANCE.BMP", "PANBAR.BMP", "POSBAR.BMP", "PLAYPAUS.BMP",
-            "SHUFREP.BMP", "MONOSTER.BMP", "EQMAIN.BMP", "EQ_EX.BMP", "PLEDIT.BMP",
-            "VISCOLOR.TXT"
+            "MAIN.BMP",
+            "CBUTTONS.BMP",
+            "TITLEBAR.BMP",
+            "NUMBERS.BMP",
+            "TEXT.BMP",
+            "VOLUME.BMP",
+            "BALANCE.BMP",
+            "PANBAR.BMP",
+            "POSBAR.BMP",
+            "PLAYPAUS.BMP",
+            "SHUFREP.BMP",
+            "MONOSTER.BMP",
+            "EQMAIN.BMP",
+            "EQ_EX.BMP",
+            "PLEDIT.BMP",
+            "VISCOLOR.TXT",
         ];
-        const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024; // 8MB safety ceiling
 
-        let mut files: HashMap<String, Vec<u8>> = HashMap::new();
-        let max_entries = archive.len().min(128);
-
-        for i in 0..max_entries {
-            if let Ok(mut entry) = archive.by_index(i) {
-                if entry.is_file() {
-                    let filename = entry.name().to_ascii_uppercase().replace('\\', "/");
-                    let base_name = filename.rsplit('/').next().unwrap_or(&filename).to_string();
-
-                    if KNOWN_ASSETS.contains(&base_name.as_str()) {
-                        if entry.size() <= MAX_ENTRY_BYTES {
-                            let mut data = Vec::with_capacity((entry.size() as usize).min(1024 * 1024));
-                            if entry.by_ref().take(MAX_ENTRY_BYTES).read_to_end(&mut data).is_ok() {
-                                files.insert(base_name, data);
-                            }
-                        }
-                    }
-                }
-            }
+        let mut archive = zip::ZipArchive::new(reader).map_err(|error| error.to_string())?;
+        if archive.len() > MAX_ARCHIVE_ENTRIES {
+            return Err("Skin archive contains too many entries".to_string());
         }
 
-        // Must contain at least one essential skin file
-        let has_essential = files.contains_key("MAIN.BMP")
-            || files.contains_key("CBUTTONS.BMP")
-            || files.contains_key("TITLEBAR.BMP")
-            || files.contains_key("EQMAIN.BMP")
-            || files.contains_key("PLEDIT.BMP");
+        let mut files: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut total_declared = 0u64;
+        let mut total_read = 0u64;
+        for index in 0..archive.len() {
+            // zip 2.6.1 exposes the final entry for a duplicate exact name at a
+            // single index, so inspect names by index and open only recognized assets.
+            let filename = archive
+                .name_for_index(index)
+                .ok_or_else(|| format!("Invalid skin archive entry {index}"))?
+                .to_ascii_uppercase()
+                .replace('\\', "/");
+            if filename.ends_with('/') {
+                continue;
+            }
 
-        if !has_essential {
-            return Err("Archive does not contain classic Winamp skin bitmaps".to_string());
+            let base_name = filename.rsplit('/').next().unwrap_or(&filename).to_string();
+            if !KNOWN_ASSETS.contains(&base_name.as_str()) {
+                continue;
+            }
+            let essential = matches!(
+                base_name.as_str(),
+                "MAIN.BMP" | "CBUTTONS.BMP" | "TITLEBAR.BMP" | "EQMAIN.BMP" | "PLEDIT.BMP"
+            );
+
+            // Read metadata without decoding first so size limits still apply to
+            // recognized files even when their compression method is unsupported.
+            let raw_entry = match archive.by_index_raw(index) {
+                Ok(entry) => entry,
+                Err(error) if essential => {
+                    return Err(format!("Could not inspect skin asset {base_name}: {error}"));
+                }
+                Err(_) => continue,
+            };
+            if !raw_entry.is_file() {
+                continue;
+            }
+            let declared_size = raw_entry.size();
+            drop(raw_entry);
+
+            if declared_size > MAX_ENTRY_BYTES {
+                return Err(format!("Skin asset {base_name} exceeds the size limit"));
+            }
+            total_declared = total_declared
+                .checked_add(declared_size)
+                .ok_or_else(|| "Skin archive size overflow".to_string())?;
+            if total_declared > MAX_TOTAL_ENTRY_BYTES {
+                return Err("Skin archive exceeds the uncompressed size limit".to_string());
+            }
+
+            let mut entry = match archive.by_index(index) {
+                Ok(entry) => entry,
+                Err(error) if essential => {
+                    return Err(format!("Could not read skin asset {base_name}: {error}"));
+                }
+                Err(_) => continue,
+            };
+            let mut data = Vec::with_capacity((declared_size as usize).min(1024 * 1024));
+            let read_result = entry
+                .by_ref()
+                .take(MAX_ENTRY_BYTES + 1)
+                .read_to_end(&mut data);
+            let actual_size = data.len() as u64;
+            total_read = total_read
+                .checked_add(actual_size)
+                .ok_or_else(|| "Skin archive size overflow".to_string())?;
+            if total_read > MAX_TOTAL_ENTRY_BYTES {
+                return Err("Skin archive exceeds the uncompressed size limit".to_string());
+            }
+            if let Err(error) = read_result {
+                if essential {
+                    return Err(format!("Could not read skin asset {base_name}: {error}"));
+                }
+                continue;
+            }
+            if actual_size != declared_size || actual_size > MAX_ENTRY_BYTES {
+                if essential {
+                    return Err(format!("Invalid size for skin asset {base_name}"));
+                }
+                continue;
+            }
+            if files.insert(base_name.clone(), data).is_some() {
+                return Err(format!("Skin archive contains duplicate asset {base_name}"));
+            }
         }
 
         let mut skin = Self::load_default();
         skin.name = name;
+        let mut has_decoded_essential = false;
+        apply_image(&files, "MAIN.BMP", &mut skin.main, true, &mut has_decoded_essential)?;
+        apply_image(
+            &files,
+            "CBUTTONS.BMP",
+            &mut skin.cbuttons,
+            true,
+            &mut has_decoded_essential,
+        )?;
+        apply_image(
+            &files,
+            "TITLEBAR.BMP",
+            &mut skin.titlebar,
+            true,
+            &mut has_decoded_essential,
+        )?;
+        apply_image(&files, "NUMBERS.BMP", &mut skin.numbers, false, &mut has_decoded_essential)?;
+        apply_image(&files, "TEXT.BMP", &mut skin.text, false, &mut has_decoded_essential)?;
+        apply_image(&files, "VOLUME.BMP", &mut skin.volume, false, &mut has_decoded_essential)?;
+        let balance_asset = if files.contains_key("BALANCE.BMP") {
+            "BALANCE.BMP"
+        } else {
+            "PANBAR.BMP"
+        };
+        apply_image(&files, balance_asset, &mut skin.balance, false, &mut has_decoded_essential)?;
+        apply_image(&files, "POSBAR.BMP", &mut skin.posbar, false, &mut has_decoded_essential)?;
+        apply_image(&files, "PLAYPAUS.BMP", &mut skin.playpaus, false, &mut has_decoded_essential)?;
+        apply_image(&files, "SHUFREP.BMP", &mut skin.shufrep, false, &mut has_decoded_essential)?;
+        apply_image(&files, "MONOSTER.BMP", &mut skin.monoster, false, &mut has_decoded_essential)?;
+        apply_image(&files, "EQMAIN.BMP", &mut skin.eqmain, true, &mut has_decoded_essential)?;
+        apply_image(&files, "EQ_EX.BMP", &mut skin.eq_ex, false, &mut has_decoded_essential)?;
+        apply_image(&files, "PLEDIT.BMP", &mut skin.pledit, true, &mut has_decoded_essential)?;
 
-        if let Some(data) = files.get("MAIN.BMP") {
-            if let Some(img) = decode_image(data) { skin.main = img; }
-        }
-        if let Some(data) = files.get("CBUTTONS.BMP") {
-            if let Some(img) = decode_image(data) { skin.cbuttons = img; }
-        }
-        if let Some(data) = files.get("TITLEBAR.BMP") {
-            if let Some(img) = decode_image(data) { skin.titlebar = img; }
-        }
-        if let Some(data) = files.get("NUMBERS.BMP") {
-            if let Some(img) = decode_image(data) { skin.numbers = img; }
-        }
-        if let Some(data) = files.get("TEXT.BMP") {
-            if let Some(img) = decode_image(data) { skin.text = img; }
-        }
-        if let Some(data) = files.get("VOLUME.BMP") {
-            if let Some(img) = decode_image(data) { skin.volume = img; }
-        }
-        if let Some(data) = files.get("BALANCE.BMP").or_else(|| files.get("PANBAR.BMP")) {
-            if let Some(img) = decode_image(data) { skin.balance = img; }
-        }
-        if let Some(data) = files.get("POSBAR.BMP") {
-            if let Some(img) = decode_image(data) { skin.posbar = img; }
-        }
-        if let Some(data) = files.get("PLAYPAUS.BMP") {
-            if let Some(img) = decode_image(data) { skin.playpaus = img; }
-        }
-        if let Some(data) = files.get("SHUFREP.BMP") {
-            if let Some(img) = decode_image(data) { skin.shufrep = img; }
-        }
-        if let Some(data) = files.get("MONOSTER.BMP") {
-            if let Some(img) = decode_image(data) { skin.monoster = img; }
-        }
-        if let Some(data) = files.get("EQMAIN.BMP") {
-            if let Some(img) = decode_image(data) { skin.eqmain = img; }
-        }
-        if let Some(data) = files.get("EQ_EX.BMP") {
-            if let Some(img) = decode_image(data) { skin.eq_ex = img; }
-        }
-        if let Some(data) = files.get("PLEDIT.BMP") {
-            if let Some(img) = decode_image(data) { skin.pledit = img; }
+        if !has_decoded_essential {
+            return Err("Archive does not contain decodable classic Winamp skin bitmaps".to_string());
         }
         if let Some(data) = files.get("VISCOLOR.TXT") {
             if let Ok(vis_text) = std::str::from_utf8(data) {
@@ -184,19 +269,62 @@ impl Skin {
     }
 }
 
-/// Helper function to decode images from BMP or PNG data
-pub fn decode_image(data: &[u8]) -> Option<ColorImage> {
-    if let Ok(img) = image::load_from_memory(data) {
-        if img.width() > 2048 || img.height() > 2048 {
-            return None;
+fn bounded_image_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    limits
+}
+
+fn apply_image(
+    files: &HashMap<String, Vec<u8>>,
+    asset: &str,
+    target: &mut ColorImage,
+    essential: bool,
+    has_decoded_essential: &mut bool,
+) -> Result<(), String> {
+    if let Some(data) = files.get(asset) {
+        if let Some(image) = decode_image(data) {
+            *target = image;
+            if essential {
+                *has_decoded_essential = true;
+            }
+        } else if essential {
+            return Err(format!("Could not decode skin asset {asset}"));
         }
-        let rgba = img.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        let pixels = rgba.into_raw();
-        Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
-    } else {
-        None
     }
+    Ok(())
+}
+
+/// Helper function to decode bounded BMP or PNG data.
+pub fn decode_image(data: &[u8]) -> Option<ColorImage> {
+    if data.is_empty() || data.len() as u64 > MAX_ENTRY_BYTES {
+        return None;
+    }
+
+    let mut header_reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    header_reader.limits(bounded_image_limits());
+    let (header_w, header_h) = header_reader.into_dimensions().ok()?;
+    if header_w == 0 || header_h == 0 || header_w > MAX_IMAGE_DIMENSION || header_h > MAX_IMAGE_DIMENSION {
+        return None;
+    }
+
+    let mut reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(bounded_image_limits());
+    let img = reader.decode().ok()?;
+    if img.width() != header_w || img.height() != header_h {
+        return None;
+    }
+
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    let pixels = rgba.into_raw();
+    Some(ColorImage::from_rgba_unmultiplied(size, &pixels))
 }
 
 fn fallback_image() -> ColorImage {
@@ -429,5 +557,91 @@ impl Sprites {
         let mut rect = Self::char_rect(ch);
         rect.y += 18.0; // 3 rows down
         rect
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Skin;
+    use std::io::{Cursor, Write};
+
+    fn make_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(data).unwrap();
+        }
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn patch_compression_method(bytes: &mut [u8], name: &[u8], method: u16) {
+        let mut local_header_found = false;
+        for offset in 0..bytes.len().saturating_sub(3) {
+            if bytes.get(offset..offset + 4) != Some(b"PK\x03\x04") || offset + 30 > bytes.len() {
+                continue;
+            }
+            let name_len = u16::from_le_bytes([bytes[offset + 26], bytes[offset + 27]]) as usize;
+            let name_start = offset + 30;
+            if bytes.get(name_start..name_start + name_len) == Some(name) {
+                bytes[offset + 8..offset + 10].copy_from_slice(&method.to_le_bytes());
+                local_header_found = true;
+            }
+        }
+
+        let mut central_header_found = false;
+        for offset in 0..bytes.len().saturating_sub(3) {
+            if bytes.get(offset..offset + 4) != Some(b"PK\x01\x02") || offset + 46 > bytes.len() {
+                continue;
+            }
+            let name_len = u16::from_le_bytes([bytes[offset + 28], bytes[offset + 29]]) as usize;
+            let name_start = offset + 46;
+            if bytes.get(name_start..name_start + name_len) == Some(name) {
+                bytes[offset + 10..offset + 12].copy_from_slice(&method.to_le_bytes());
+                central_header_found = true;
+            }
+        }
+        assert!(local_header_found && central_header_found);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let image = image::GrayImage::new(2, 2);
+        let mut png = Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        png.into_inner()
+    }
+
+    #[test]
+    fn skips_unknown_entry_with_unsupported_compression() {
+        let png = tiny_png();
+        let mut bytes = make_archive(&[("MAIN.BMP", &png), ("README.txt", b"skin notes")]);
+        // Method 12 is BZIP2, which is not enabled for this crate.
+        patch_compression_method(&mut bytes, b"README.txt", 12);
+
+        let skin = Skin::load_archive("test".to_string(), Cursor::new(bytes)).unwrap();
+        assert_eq!(skin.main.size, [2, 2]);
+    }
+
+    #[test]
+    fn invalid_optional_sprites_keep_embedded_fallbacks() {
+        let png = tiny_png();
+        let mut bytes = make_archive(&[
+            ("MAIN.BMP", &png),
+            ("VOLUME.BMP", &png),
+            ("NUMBERS.BMP", b"not an image"),
+        ]);
+        patch_compression_method(&mut bytes, b"VOLUME.BMP", 12);
+
+        let skin = Skin::load_archive("test".to_string(), Cursor::new(bytes)).unwrap();
+        let default = Skin::load_default();
+        assert_eq!(skin.volume, default.volume);
+        assert_eq!(skin.numbers, default.numbers);
+    }
+
+    #[test]
+    fn optional_sprites_do_not_replace_the_essential_bitmap_requirement() {
+        let bytes = make_archive(&[("VOLUME.BMP", b"not an image")]);
+        assert!(Skin::load_archive("test".to_string(), Cursor::new(bytes)).is_err());
     }
 }

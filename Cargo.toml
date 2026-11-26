@@ -21,6 +21,11 @@ name = "retroamp-gpui"
 path = "src/bin/retroamp-gpui.rs"
 required-features = ["gpui-ui"]
 
+[[test]]
+name = "ui_geometry"
+path = "tests/ui_geometry.rs"
+required-features = ["egui-ui"]
+
 [dependencies]
 eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = { version = "0.31", optional = true }

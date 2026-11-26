@@ -46,6 +46,34 @@ impl UiTheme {
     }
 }
 
+fn persistable_skin_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn try_auto_advance(
+    item_count: usize,
+    current_index: Option<usize>,
+    shuffle: bool,
+    mut try_play: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    let mut candidates: Vec<usize> = if shuffle {
+        (0..item_count).collect()
+    } else {
+        (current_index.map_or(0, |index| index.saturating_add(1))..item_count).collect()
+    };
+
+    if shuffle {
+        fastrand::shuffle(&mut candidates);
+    }
+
+    candidates
+        .into_iter()
+        .find(|&index| try_play(index))
+}
+
 pub struct WinampApp {
     pub skin: Skin,
     pub textures: Option<SkinTextures>,
@@ -54,6 +82,7 @@ pub struct WinampApp {
     pub eq_state: EqWindowState,
     pub playlist_state: PlaylistWindowState,
     pub current_track_index: Option<usize>,
+    pub playback_error: Option<String>,
     pub snap_distance: f32,
     pub eq_docked: bool,
     pub pl_docked: bool,
@@ -63,6 +92,9 @@ pub struct WinampApp {
     pub show_skin_picker: bool,
     pub show_about: bool,
     pub active_theme: UiTheme,
+    /// Bitmap skin source: "nord_frost" or an absolute imported .wsz path.
+    /// None means the embedded default skin; alternative renderers don't use it.
+    pub skin_source: Option<String>,
     /// Last-saved configuration (change detection + persistence).
     pub config_cache: AppConfig,
     pub config_dirty: bool,
@@ -88,7 +120,7 @@ impl MenuPalette {
             UiTheme::WinampRedrawn | UiTheme::ClassicWinamp => Self {
                 frame_fill: Color32::from_rgb(192, 192, 192),
                 frame_stroke: Color32::BLACK,
-                section: Color32::from_rgb(90, 90, 90),
+                section: Color32::from_rgb(62, 62, 62),
                 text: Color32::BLACK,
                 hover_bg: Color32::from_rgb(0, 0, 128),
                 hover_text: Color32::WHITE,
@@ -98,7 +130,7 @@ impl MenuPalette {
             UiTheme::ModernHifi => Self {
                 frame_fill: Color32::from_rgb(12, 14, 18),
                 frame_stroke: Color32::from_rgb(60, 70, 90),
-                section: Color32::from_rgb(100, 110, 130),
+                section: Color32::from_rgb(150, 162, 182),
                 text: Color32::from_rgb(225, 230, 240),
                 hover_bg: Color32::from_rgb(0, 240, 255),
                 hover_text: Color32::from_rgb(0, 10, 16),
@@ -120,9 +152,27 @@ impl MenuPalette {
 
 /// One selectable menu row, painted in the theme palette.
 fn menu_item(ui: &mut egui::Ui, p: &MenuPalette, label: &str, checked: bool) -> bool {
+    menu_item_with_initial_focus(ui, p, label, checked, false)
+}
+
+fn menu_item_with_initial_focus(
+    ui: &mut egui::Ui,
+    p: &MenuPalette,
+    label: &str,
+    checked: bool,
+    request_focus: bool,
+) -> bool {
     let width = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 16.0), egui::Sense::click());
-    if resp.hovered() || resp.is_pointer_button_down_on() {
+    if request_focus {
+        resp.request_focus();
+    }
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, checked, label));
+    if resp.gained_focus() {
+        resp.scroll_to_me(None);
+    }
+    let highlighted = resp.hovered() || resp.is_pointer_button_down_on() || resp.has_focus();
+    if highlighted {
         ui.painter().rect_filled(rect, 2.0, p.hover_bg);
     }
     let text = if checked { format!("✓  {label}") } else { format!("    {label}") };
@@ -131,7 +181,7 @@ fn menu_item(ui: &mut egui::Ui, p: &MenuPalette, label: &str, checked: bool) -> 
         egui::Align2::LEFT_CENTER,
         &text,
         egui::FontId::new(10.5, egui::FontFamily::Proportional),
-        if resp.hovered() { p.hover_text } else { p.text },
+        if highlighted { p.hover_text } else { p.text },
     );
     resp.clicked()
 }
@@ -155,42 +205,15 @@ impl WinampApp {
         let mut audio = AudioEngine::new();
         let mut playlist_state = PlaylistWindowState::default();
 
-        // Check if sample tracks exist in /mnt/data/The WIRED CD - Rip. Sample. Mash. Share
-        let sample_dir = Path::new("/mnt/data/The WIRED CD - Rip. Sample. Mash. Share");
-        if sample_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(sample_dir) {
-                let mut paths: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(|ext| ext.eq_ignore_ascii_case("mp3") || ext.eq_ignore_ascii_case("wav") || ext.eq_ignore_ascii_case("ogg") || ext.eq_ignore_ascii_case("flac"))
-                            .unwrap_or(false)
-                    })
-                    .collect();
-                paths.sort();
-
-                for path in paths {
-                    let title = path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "Track".to_string());
-                    playlist_state.items.push(PlaylistEntry {
-                        title,
-                        path,
-                        duration_secs: 180,
-                    });
-                }
-            }
-        }
-
         // Load persisted configuration, then let env vars override at launch.
         let cfg = AppConfig::load();
 
         // Theme: env (RETROAMP_SKIN) wins over saved config.
+        let env_override = std::env::var("RETROAMP_SKIN")
+            .or_else(|_| std::env::var("WINAMP_SKIN"))
+            .ok();
         let mut initial_theme = UiTheme::from_str(&cfg.theme);
-        if let Ok(skin_name) = std::env::var("RETROAMP_SKIN").or_else(|_| std::env::var("WINAMP_SKIN")) {
+        if let Some(skin_name) = env_override.as_deref() {
             initial_theme = match skin_name.to_lowercase().as_str() {
                 "hifi" | "studio" | "silver" => UiTheme::ModernHifi,
                 "cyberpunk" | "terminal" | "matrix" => UiTheme::CyberpunkTerminal,
@@ -198,11 +221,53 @@ impl WinampApp {
                 _ => initial_theme,
             };
         }
-        let initial_skin = match initial_theme {
-            UiTheme::ModernHifi => Skin::load_wsz("assets/skins/hifi_studio.wsz").unwrap_or_else(|_| Skin::load_default()),
-            UiTheme::CyberpunkTerminal => Skin::load_wsz("assets/skins/cyberpunk.wsz").unwrap_or_else(|_| Skin::load_default()),
-            UiTheme::WinampRedrawn | UiTheme::ClassicWinamp => Skin::load_default(),
-        };
+        let mut initial_skin = Skin::load_default();
+        let mut skin_source = None;
+        let env_requested_nord = env_override.as_deref().is_some_and(|name| {
+            matches!(name.to_ascii_lowercase().as_str(), "nord" | "frost" | "catppuccin")
+        });
+        if env_requested_nord {
+            match Skin::load_nord_frost() {
+                Ok(skin) => {
+                    initial_skin = skin;
+                    skin_source = Some("nord_frost".to_string());
+                }
+                Err(error) => log::warn!("Bundled Nord Frost skin failed to load: {error}"),
+            }
+        } else if env_override.is_none() && initial_theme == UiTheme::ClassicWinamp {
+            if let Some(saved) = cfg.skin.clone().filter(|saved| {
+                !saved.is_empty()
+                    && saved != "default"
+                    && saved != "hifi_studio"
+                    && saved != "cyberpunk"
+            }) {
+                // Keep the user's desired source even when it cannot be loaded
+                // right now, so a temporary missing file does not erase it on exit.
+                skin_source = Some(saved.clone());
+                if saved == "nord_frost" {
+                    match Skin::load_nord_frost() {
+                        Ok(skin) => {
+                            initial_skin = skin;
+                            skin_source = Some(saved);
+                        }
+                        Err(error) => {
+                            log::warn!("Saved Nord Frost skin failed to load: {error}");
+                        }
+                    }
+                } else {
+                    let path = PathBuf::from(&saved);
+                    match Skin::load_wsz(&path) {
+                        Ok(skin) => {
+                            initial_skin = skin;
+                            skin_source = Some(persistable_skin_path(&path));
+                        }
+                        Err(error) => {
+                            log::warn!("Saved skin {} failed to load: {error}", path.display());
+                        }
+                    }
+                }
+            }
+        }
 
         // Scale: env override, else saved config.
         let ui_scale = std::env::var("RETROAMP_SCALE")
@@ -214,6 +279,7 @@ impl WinampApp {
 
         // Apply persisted playlist size (13px rows + 58px chrome, classic metric).
         playlist_state.height = 58.0 + cfg.playlist_rows.clamp(2.0, 64.0) * 13.0;
+        playlist_state.height_unsnapped = playlist_state.height;
 
         // Apply persisted playback/UX toggles.
         audio.set_volume(cfg.volume.clamp(0.0, 1.0));
@@ -237,6 +303,7 @@ impl WinampApp {
             show_eq: cfg.show_eq,
             show_playlist: cfg.show_playlist,
             vis_spectrum: cfg.vis_spectrum,
+            skin: skin_source.clone(),
         };
 
         Self {
@@ -247,6 +314,7 @@ impl WinampApp {
             eq_state: EqWindowState::default(),
             playlist_state,
             current_track_index: None,
+            playback_error: None,
             snap_distance: 12.0,
             eq_docked: true,
             pl_docked: true,
@@ -254,6 +322,7 @@ impl WinampApp {
             show_skin_picker: false,
             show_about: false,
             active_theme: initial_theme,
+            skin_source,
             config_cache,
             config_dirty: false,
             last_config_save: Instant::now(),
@@ -265,29 +334,40 @@ impl WinampApp {
         AppConfig {
             ui_scale: self.ui_scale,
             theme: self.active_theme.as_str().to_string(),
-            playlist_rows: ((self.playlist_state.height - 58.0) / 13.0).round().clamp(2.0, 64.0),
+            playlist_rows: ((self.playlist_state.height - 58.0) / 13.0).clamp(2.0, 64.0),
             volume: self.audio.volume,
             shuffle: self.main_state.shuffle,
             repeat: self.main_state.repeat,
             show_eq: self.main_state.show_eq,
             show_playlist: self.main_state.show_playlist,
             vis_spectrum: self.main_state.vis_mode == VisMode::Spectrum,
+            skin: self.skin_source.clone(),
         }
     }
 
-    pub fn play_track_index(&mut self, index: usize) {
-        if index < self.playlist_state.items.len() {
-            let path = self.playlist_state.items[index].path.clone();
-            match self.audio.play_file(&path) {
-                Ok(()) => {
-                    self.current_track_index = Some(index);
-                    if let Some(ref track) = self.audio.current_track {
-                        self.playlist_state.items[index].duration_secs = track.duration.as_secs();
-                    }
+    pub fn play_track_index(&mut self, index: usize) -> bool {
+        if index >= self.playlist_state.items.len() {
+            return false;
+        }
+
+        let path = self.playlist_state.items[index].path.clone();
+        match self.audio.play_file(&path) {
+            Ok(()) => {
+                self.current_track_index = Some(index);
+                self.playlist_state.selected_index = Some(index);
+                self.playback_error = None;
+                if let Some(ref track) = self.audio.current_track {
+                    self.playlist_state.items[index].duration_secs = track.duration.as_secs();
                 }
-                Err(e) => {
-                    log::error!("Error playing audio file {}: {e}", path.display());
-                }
+                true
+            }
+            Err(e) => {
+                log::error!("Error playing audio file {}: {e}", path.display());
+                let title = self.playlist_state.items[index].title.clone();
+                self.playback_error = Some(format!(
+                    "Unable to play ‘{title}’: {e}. Choose another track or open a different file."
+                ));
+                false
             }
         }
     }
@@ -308,6 +388,21 @@ impl WinampApp {
         self.play_track_index(next_idx);
     }
 
+    /// Auto-advance at end of track (EOF). Unlike manual Next — which wraps
+    /// around like Winamp — this stops at the end of the playlist unless
+    /// repeat or shuffle is on. Unplayable entries are skipped once per pass.
+    pub fn play_next_auto(&mut self) {
+        let next = try_auto_advance(
+            self.playlist_state.items.len(),
+            self.current_track_index,
+            self.main_state.shuffle,
+            |index| self.play_track_index(index),
+        );
+        if next.is_none() {
+            self.audio.stop();
+        }
+    }
+
     pub fn play_prev(&mut self) {
         if self.playlist_state.items.is_empty() {
             return;
@@ -325,7 +420,6 @@ impl WinampApp {
     pub fn open_file_dialog(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
             .add_filter("Audio & Skins", &["mp3", "flac", "wav", "ogg", "aac", "wsz", "zip"])
-            .set_directory("/mnt/data")
             .pick_files()
         {
             for path in paths {
@@ -346,9 +440,12 @@ impl WinampApp {
             match Skin::load_wsz(&path) {
                 Ok(new_skin) => {
                     self.skin = new_skin;
+                    self.active_theme = UiTheme::ClassicWinamp;
                     if let Some(ref mut textures) = self.textures {
                         textures.update(&self.skin);
                     }
+                    // Store a stable absolute path so the custom skin survives restarts.
+                    self.skin_source = Some(persistable_skin_path(&path));
                     log::info!("Loaded skin: {}", self.skin.name);
                 }
                 Err(e) => {
@@ -489,6 +586,13 @@ impl WinampApp {
         let mut zoom_action: Option<f32> = None;
 
         ctx.input(|i| {
+            if i.key_pressed(Key::F10) {
+                self.main_state.menu_open = !self.main_state.menu_open;
+                self.main_state.menu_frames = 0;
+            }
+            if self.main_state.menu_open || (self.main_state.show_eq && self.eq_state.show_presets) || self.show_skin_picker || self.show_about {
+                return;
+            }
             if i.key_pressed(Key::Z) { do_prev = true; }
             if i.key_pressed(Key::X) { do_play = true; }
             if i.key_pressed(Key::C) { do_pause = true; }
@@ -555,8 +659,6 @@ impl App for WinampApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint();
-
         // Apply UI scale (auto-fit below works in points, so it composes
         // with the zoom: the window grows physically as the skin grows).
         ctx.set_zoom_factor(self.ui_scale);
@@ -570,11 +672,14 @@ impl App for WinampApp {
         let track_finished = self.audio.update();
         if track_finished {
             if self.main_state.repeat {
-                if let Some(idx) = self.current_track_index {
-                    self.play_track_index(idx);
+                let restarted = self
+                    .current_track_index
+                    .is_some_and(|index| self.play_track_index(index));
+                if !restarted {
+                    self.play_next_auto();
                 }
             } else {
-                self.play_next();
+                self.play_next_auto();
             }
         }
 
@@ -608,6 +713,9 @@ impl App for WinampApp {
         let mut main_action = MainAction::None;
         let mut eq_action = EqAction::None;
         let mut pl_action = PlaylistAction::None;
+        let active_track_index = self
+            .current_track_index
+            .filter(|_| self.audio.state != PlaybackState::Stopped);
 
         // Root container: no fill — the skin panels float directly on the
         // desktop (transparent window), like real Winamp.
@@ -621,7 +729,7 @@ impl App for WinampApp {
                             eq_action = render_vector_eq(ui, &mut self.eq_state, &mut self.audio);
                         }
                         if self.main_state.show_playlist {
-                            pl_action = render_vector_playlist(ui, &mut self.playlist_state, self.current_track_index, &self.audio);
+                            pl_action = render_vector_playlist(ui, &mut self.playlist_state, active_track_index, &self.audio);
                         }
                     }
                     UiTheme::ModernHifi => {
@@ -630,7 +738,7 @@ impl App for WinampApp {
                             eq_action = render_hifi_eq(ui, &mut self.eq_state, &mut self.audio);
                         }
                         if self.main_state.show_playlist {
-                            pl_action = render_hifi_playlist(ui, &mut self.playlist_state, self.current_track_index, &self.audio);
+                            pl_action = render_hifi_playlist(ui, &mut self.playlist_state, active_track_index, &self.audio);
                         }
                     }
                     UiTheme::CyberpunkTerminal => {
@@ -639,7 +747,7 @@ impl App for WinampApp {
                             eq_action = render_cyberpunk_eq(ui, &mut self.eq_state, &mut self.audio);
                         }
                         if self.main_state.show_playlist {
-                            pl_action = render_cyberpunk_playlist(ui, &mut self.playlist_state, self.current_track_index, &self.audio);
+                            pl_action = render_cyberpunk_playlist(ui, &mut self.playlist_state, active_track_index, &self.audio);
                         }
                     }
                     UiTheme::ClassicWinamp => {
@@ -668,7 +776,7 @@ impl App for WinampApp {
                             pl_action = render_playlist_window(
                                 ui,
                                 &mut self.playlist_state,
-                                self.current_track_index,
+                                active_track_index,
                                 &self.audio,
                                 &self.skin,
                                 &textures,
@@ -730,7 +838,7 @@ impl App for WinampApp {
 
         // --- RetroAmp Main Menu (classic Winamp-style) ------------------------
         if self.main_state.menu_open {
-            self.main_state.menu_frames += 1;
+            self.main_state.menu_frames = self.main_state.menu_frames.saturating_add(1);
             let mut menu_action: Option<MainAction> = None;
             let mut close_menu = false;
             let mut menu_zoom: Option<f32> = None;
@@ -738,12 +846,15 @@ impl App for WinampApp {
             let p = MenuPalette::for_theme(self.active_theme);
 
             let menu_pos = self.main_state.position + egui::vec2(8.0, 20.0);
-            let menu_win = egui::Window::new("retroamp_menu")
-                .id(egui::Id::new("retroamp-main-menu"))
-                .title_bar(false)
-                .resizable(false)
-                .collapsible(false)
-                .fixed_pos(menu_pos)
+            let menu_id = egui::Id::new("retroamp-main-menu");
+            // The full item list is ~520pt tall — taller than the default
+            // 362pt stack. Cap the popup to the space below its anchor and
+            // scroll inside, so it can never spill past the viewport.
+            let menu_max_h =
+                (ctx.input(|i| i.screen_rect().bottom()) - menu_pos.y - 14.0).max(1.0);
+            let menu_win = egui::Modal::new(menu_id)
+                .area(egui::Modal::default_area(menu_id).fixed_pos(menu_pos))
+                .backdrop_color(Color32::TRANSPARENT)
                 .frame(
                     egui::Frame::window(&ctx.style())
                         .fill(p.frame_fill)
@@ -754,76 +865,88 @@ impl App for WinampApp {
                     ui.set_min_width(210.0);
                     ui.set_max_width(210.0);
 
-                    menu_section(ui, &p, "FILE");
-                    if menu_item(ui, &p, "Open File(s)…   (L)", false) { menu_action = Some(MainAction::Eject); close_menu = true; }
-                    if menu_item(ui, &p, "Open Skin / Themes…   (S)", false) { menu_action = Some(MainAction::LoadSkin); close_menu = true; }
-                    if menu_item(ui, &p, "Exit", false) { menu_action = Some(MainAction::Close); close_menu = true; }
+                    egui::ScrollArea::vertical()
+                        .max_height(menu_max_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            menu_section(ui, &p, "FILE");
+                            if menu_item_with_initial_focus(
+                                ui,
+                                &p,
+                                "Open File(s)…   (L)",
+                                false,
+                                self.main_state.menu_frames == 1,
+                            ) {
+                                menu_action = Some(MainAction::Eject);
+                                close_menu = true;
+                            }
+                            if menu_item(ui, &p, "Open Skin / Themes…   (S)", false) { menu_action = Some(MainAction::LoadSkin); close_menu = true; }
+                            if menu_item(ui, &p, "Exit", false) { menu_action = Some(MainAction::Close); close_menu = true; }
 
-                    ui.separator();
-                    menu_section(ui, &p, "PLAYBACK");
-                    if menu_item(ui, &p, "Previous   (Z)", false) { menu_action = Some(MainAction::Prev); close_menu = true; }
-                    if menu_item(ui, &p, "Play   (X)", false) { menu_action = Some(MainAction::Play); close_menu = true; }
-                    if menu_item(ui, &p, "Pause / Resume   (C)", false) { menu_action = Some(MainAction::Pause); close_menu = true; }
-                    if menu_item(ui, &p, "Stop   (V)", false) { menu_action = Some(MainAction::Stop); close_menu = true; }
-                    if menu_item(ui, &p, "Next   (B)", false) { menu_action = Some(MainAction::Next); close_menu = true; }
-                    if menu_item(ui, &p, "Shuffle", self.main_state.shuffle) {
-                        self.main_state.shuffle = !self.main_state.shuffle;
-                        close_menu = true;
-                    }
-                    if menu_item(ui, &p, "Repeat", self.main_state.repeat) {
-                        self.main_state.repeat = !self.main_state.repeat;
-                        close_menu = true;
-                    }
+                            ui.separator();
+                            menu_section(ui, &p, "PLAYBACK");
+                            if menu_item(ui, &p, "Previous   (Z)", false) { menu_action = Some(MainAction::Prev); close_menu = true; }
+                            if menu_item(ui, &p, "Play   (X)", false) { menu_action = Some(MainAction::Play); close_menu = true; }
+                            if menu_item(ui, &p, "Pause / Resume   (C)", false) { menu_action = Some(MainAction::Pause); close_menu = true; }
+                            if menu_item(ui, &p, "Stop   (V)", false) { menu_action = Some(MainAction::Stop); close_menu = true; }
+                            if menu_item(ui, &p, "Next   (B)", false) { menu_action = Some(MainAction::Next); close_menu = true; }
+                            if menu_item(ui, &p, "Shuffle", self.main_state.shuffle) {
+                                self.main_state.shuffle = !self.main_state.shuffle;
+                                close_menu = true;
+                            }
+                            if menu_item(ui, &p, "Repeat", self.main_state.repeat) {
+                                self.main_state.repeat = !self.main_state.repeat;
+                                close_menu = true;
+                            }
 
-                    ui.separator();
-                    menu_section(ui, &p, "VIEW");
-                    if menu_item(ui, &p, "Equalizer", self.main_state.show_eq) {
-                        self.main_state.show_eq = !self.main_state.show_eq;
-                        close_menu = true;
-                    }
-                    if menu_item(ui, &p, "Playlist Editor", self.main_state.show_playlist) {
-                        self.main_state.show_playlist = !self.main_state.show_playlist;
-                        close_menu = true;
-                    }
-                    for (label, val) in [("Scale 100%", 1.0), ("Scale 150%", 1.5), ("Scale 200%", 2.0), ("Scale 300%", 3.0)] {
-                        if menu_item(ui, &p, label, (self.ui_scale - val).abs() < 0.01) {
-                            menu_zoom = Some(val);
-                            close_menu = true;
-                        }
-                    }
+                            ui.separator();
+                            menu_section(ui, &p, "VIEW");
+                            if menu_item(ui, &p, "Equalizer", self.main_state.show_eq) {
+                                self.main_state.show_eq = !self.main_state.show_eq;
+                                close_menu = true;
+                            }
+                            if menu_item(ui, &p, "Playlist Editor", self.main_state.show_playlist) {
+                                self.main_state.show_playlist = !self.main_state.show_playlist;
+                                close_menu = true;
+                            }
+                            for (label, val) in [("Scale 100%", 1.0), ("Scale 150%", 1.5), ("Scale 200%", 2.0), ("Scale 300%", 3.0)] {
+                                if menu_item(ui, &p, label, (self.ui_scale - val).abs() < 0.01) {
+                                    menu_zoom = Some(val);
+                                    close_menu = true;
+                                }
+                            }
 
-                    ui.separator();
-                    menu_section(ui, &p, "THEMES");
-                    if menu_item(ui, &p, "Winamp (Redrawn)", self.active_theme == UiTheme::WinampRedrawn) {
-                        menu_theme = Some(UiTheme::WinampRedrawn);
-                        close_menu = true;
-                    }
-                    if menu_item(ui, &p, "Winamp (Bitmap 1:1)", self.active_theme == UiTheme::ClassicWinamp) {
-                        menu_theme = Some(UiTheme::ClassicWinamp);
-                        close_menu = true;
-                    }
-                    if menu_item(ui, &p, "Hi-Fi Studio", self.active_theme == UiTheme::ModernHifi) {
-                        menu_theme = Some(UiTheme::ModernHifi);
-                        close_menu = true;
-                    }
-                    if menu_item(ui, &p, "Cyberpunk Terminal", self.active_theme == UiTheme::CyberpunkTerminal) {
-                        menu_theme = Some(UiTheme::CyberpunkTerminal);
-                        close_menu = true;
-                    }
+                            ui.separator();
+                            menu_section(ui, &p, "THEMES");
+                            if menu_item(ui, &p, "Winamp (Redrawn)", self.active_theme == UiTheme::WinampRedrawn) {
+                                menu_theme = Some(UiTheme::WinampRedrawn);
+                                close_menu = true;
+                            }
+                            if menu_item(ui, &p, "Winamp (Bitmap 1:1)", self.active_theme == UiTheme::ClassicWinamp) {
+                                menu_theme = Some(UiTheme::ClassicWinamp);
+                                close_menu = true;
+                            }
+                            if menu_item(ui, &p, "Hi-Fi Studio", self.active_theme == UiTheme::ModernHifi) {
+                                menu_theme = Some(UiTheme::ModernHifi);
+                                close_menu = true;
+                            }
+                            if menu_item(ui, &p, "Cyberpunk Terminal", self.active_theme == UiTheme::CyberpunkTerminal) {
+                                menu_theme = Some(UiTheme::CyberpunkTerminal);
+                                close_menu = true;
+                            }
 
-                    ui.separator();
-                    menu_section(ui, &p, "HELP");
-                    if menu_item(ui, &p, "About RetroAmp…", false) {
-                        self.show_about = true;
-                        close_menu = true;
-                    }
+                            ui.separator();
+                            menu_section(ui, &p, "HELP");
+                            if menu_item(ui, &p, "About RetroAmp…", false) {
+                                self.show_about = true;
+                                close_menu = true;
+                            }
+                        });
                 });
 
             // Close on click outside (after the opening click has settled)
-            if let Some(r) = &menu_win {
-                if r.response.clicked_elsewhere() && self.main_state.menu_frames > 2 {
-                    close_menu = true;
-                }
+            if menu_win.backdrop_response.clicked() && self.main_state.menu_frames > 2 {
+                close_menu = true;
             }
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 close_menu = true;
@@ -837,18 +960,14 @@ impl App for WinampApp {
             }
             if let Some(theme) = menu_theme {
                 self.active_theme = theme;
-                // Load matching skin assets for the classic engine
-                let skin_result = match theme {
-                    UiTheme::ModernHifi => Skin::load_wsz("assets/skins/hifi_studio.wsz"),
-                    UiTheme::CyberpunkTerminal => Skin::load_wsz("assets/skins/cyberpunk.wsz"),
-                    UiTheme::WinampRedrawn | UiTheme::ClassicWinamp => Ok(Skin::load_default()),
-                };
-                if let Ok(new_skin) = skin_result {
-                    self.skin = new_skin;
+                // Only the classic bitmap renderer consumes SkinTextures.
+                if matches!(theme, UiTheme::WinampRedrawn | UiTheme::ClassicWinamp) {
+                    self.skin = Skin::load_default();
                     if let Some(ref mut textures) = self.textures {
                         textures.update(&self.skin);
                     }
                 }
+                self.skin_source = None;
             }
             if let Some(a) = menu_action {
                 main_action = a;
@@ -890,11 +1009,15 @@ impl App for WinampApp {
 
         // --- EQ Presets popup (classic Winamp preset list) ---------------------
         if self.eq_state.show_presets && self.main_state.show_eq {
+            self.eq_state.presets_frames = self.eq_state.presets_frames.saturating_add(1);
             let p = MenuPalette::for_theme(self.active_theme);
             let mut close_presets = false;
             let mut applied_preset: Option<[f32; 10]> = None;
 
-            let presets_pos = self.eq_state.position + egui::vec2(196.0, 30.0);
+            let screen = ctx.input(|i| i.screen_rect());
+            let mut presets_pos = self.eq_state.position + egui::vec2(196.0, 32.0);
+            presets_pos.x = presets_pos.x.min(screen.right() - 184.0).max(screen.left());
+            let presets_max_h = (screen.bottom() - presets_pos.y - 32.0).clamp(1.0, 238.0);
             let presets_win = egui::Window::new("retroamp_eq_presets")
                 .id(egui::Id::new("retroamp-eq-presets"))
                 .title_bar(false)
@@ -911,7 +1034,7 @@ impl App for WinampApp {
                     ui.set_min_width(170.0);
                     ui.set_max_width(170.0);
                     menu_section(ui, &p, "EQUALIZER PRESETS");
-                    egui::ScrollArea::vertical().max_height(238.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(presets_max_h).show(ui, |ui| {
                         for (name, bands) in crate::audio::EQ_PRESETS {
                             let active = self.audio.eq.enabled && self.audio.eq.bands[..] == bands[..];
                             if menu_item(ui, &p, name, active) {
@@ -922,8 +1045,10 @@ impl App for WinampApp {
                     });
                 });
 
+            // Ignore outside clicks for the first frames after opening —
+            // otherwise the very click that opened the popup dismisses it.
             if let Some(r) = &presets_win {
-                if r.response.clicked_elsewhere() {
+                if r.response.clicked_elsewhere() && self.eq_state.presets_frames > 2 {
                     close_presets = true;
                 }
             }
@@ -933,22 +1058,11 @@ impl App for WinampApp {
 
             if close_presets {
                 self.eq_state.show_presets = false;
+                self.eq_state.presets_frames = 0;
             }
             if let Some(bands) = applied_preset {
                 self.audio.eq.bands = bands;
             }
-        }
-
-        // --- Persist configuration (throttled change detection) ----------------
-        let current_cfg = self.config_snapshot();
-        if current_cfg != self.config_cache {
-            self.config_dirty = true;
-        }
-        if self.config_dirty && self.last_config_save.elapsed() > Duration::from_millis(800) {
-            current_cfg.save();
-            self.config_cache = current_cfg;
-            self.config_dirty = false;
-            self.last_config_save = Instant::now();
         }
 
         // Process Main actions
@@ -990,11 +1104,14 @@ impl App for WinampApp {
         // Process EQ actions
         if let EqAction::Close = eq_action {
             self.main_state.show_eq = false;
+            self.eq_state.show_presets = false;
         }
 
         // Process Playlist actions
         match pl_action {
-            PlaylistAction::PlayIndex(idx) => self.play_track_index(idx),
+            PlaylistAction::PlayIndex(idx) => {
+                self.play_track_index(idx);
+            }
             PlaylistAction::AddFiles => self.open_file_dialog(),
             PlaylistAction::RemoveSelected => {
                 if let Some(idx) = self.playlist_state.selected_index {
@@ -1039,7 +1156,7 @@ impl App for WinampApp {
         if self.show_skin_picker {
             let p = MenuPalette::for_theme(self.active_theme);
             let mut close_picker = false;
-            let mut switch_skin_path = None;
+            let mut switch_nord_frost = false;
             let mut switch_to_classic = false;
 
             egui::Window::new("🎨 RetroAmp Theme Picker")
@@ -1068,23 +1185,21 @@ impl App for WinampApp {
                     }
                     if menu_item(ui, &p, "🟢  Cyberpunk Terminal (Tokyo Phosphor)", self.active_theme == UiTheme::CyberpunkTerminal) {
                         self.active_theme = UiTheme::CyberpunkTerminal;
-                        switch_skin_path = Some(PathBuf::from("assets/skins/cyberpunk.wsz"));
+                        self.skin_source = None;
                         close_picker = true;
                     }
                     if menu_item(ui, &p, "📻  Hi-Fi Studio (Audiophile Aluminum)", self.active_theme == UiTheme::ModernHifi) {
                         self.active_theme = UiTheme::ModernHifi;
-                        switch_skin_path = Some(PathBuf::from("assets/skins/hifi_studio.wsz"));
+                        self.skin_source = None;
                         close_picker = true;
                     }
                     if menu_item(ui, &p, "❄️  Nord Frost (Slate & Ice Pastel)", self.active_theme == UiTheme::ClassicWinamp && self.skin.name == "nord_frost") {
-                        self.active_theme = UiTheme::ClassicWinamp;
-                        switch_skin_path = Some(PathBuf::from("assets/skins/nord_frost.wsz"));
+                        switch_nord_frost = true;
                         close_picker = true;
                     }
 
                     ui.separator();
                     if menu_item(ui, &p, "📂  Load Custom .wsz Skin File...", false) {
-                        self.active_theme = UiTheme::ClassicWinamp;
                         close_picker = true;
                         self.open_file_dialog();
                     }
@@ -1099,12 +1214,18 @@ impl App for WinampApp {
                 if let Some(ref mut textures) = self.textures {
                     textures.update(&self.skin);
                 }
-            } else if let Some(path) = switch_skin_path {
-                if let Ok(new_skin) = Skin::load_wsz(&path) {
-                    self.skin = new_skin;
-                    if let Some(ref mut textures) = self.textures {
-                        textures.update(&self.skin);
+                self.skin_source = None;
+            } else if switch_nord_frost {
+                match Skin::load_nord_frost() {
+                    Ok(new_skin) => {
+                        self.skin = new_skin;
+                        self.active_theme = UiTheme::ClassicWinamp;
+                        if let Some(ref mut textures) = self.textures {
+                            textures.update(&self.skin);
+                        }
+                        self.skin_source = Some("nord_frost".to_string());
                     }
+                    Err(error) => log::error!("Failed to load bundled Nord Frost skin: {error}"),
                 }
             }
 
@@ -1112,5 +1233,106 @@ impl App for WinampApp {
                 self.show_skin_picker = false;
             }
         }
+
+        if let Some(error) = self.playback_error.clone() {
+            let palette = MenuPalette::for_theme(self.active_theme);
+            let mut dismiss = false;
+            egui::Area::new(egui::Id::new("retroamp-playback-error"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
+                .show(ctx, |ui| {
+                    egui::Frame::window(&ctx.style())
+                        .fill(palette.frame_fill)
+                        .stroke(egui::Stroke::new(1.0_f32, palette.frame_stroke))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
+                        .show(ui, |ui| {
+                            ui.set_max_width(360.0);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Playback stopped")
+                                        .strong()
+                                        .color(palette.accent),
+                                );
+                                if ui.small_button("Dismiss").clicked() {
+                                    dismiss = true;
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(error)
+                                    .color(palette.text),
+                            );
+                        });
+                });
+            if dismiss {
+                self.playback_error = None;
+            }
+        }
+
+        // Persist after the interaction completes, then only wake the UI when
+        // playback, a popup's opening debounce, or a pending save needs it.
+        let current_cfg = self.config_snapshot();
+        if current_cfg != self.config_cache {
+            self.config_dirty = true;
+        }
+        if self.config_dirty && self.last_config_save.elapsed() >= Duration::from_millis(800) {
+            if current_cfg.save() {
+                self.config_cache = current_cfg;
+                self.config_dirty = false;
+            }
+            self.last_config_save = Instant::now();
+        }
+
+        let mut repaint_after = None::<Duration>;
+        if ctx.input(|input| !input.raw.events.is_empty()) {
+            // Some custom-rendered controls apply their action after painting.
+            // Give the resulting state one prompt frame, then return to idle.
+            repaint_after = Some(Duration::from_millis(16));
+        }
+        if self.audio.is_playing() {
+            repaint_after = Some(Duration::from_millis(33));
+        }
+        if (self.main_state.menu_open && self.main_state.menu_frames <= 2)
+            || (self.eq_state.show_presets && self.eq_state.presets_frames <= 2)
+        {
+            repaint_after = Some(Duration::from_millis(16));
+        }
+        if self.config_dirty {
+            let remaining = Duration::from_millis(800)
+                .saturating_sub(self.last_config_save.elapsed());
+            repaint_after = Some(repaint_after.map_or(remaining, |delay| delay.min(remaining)));
+        }
+        if let Some(delay) = repaint_after {
+            ctx.request_repaint_after(delay.max(Duration::from_millis(1)));
+        }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_advance_skips_unplayable_entries_once_until_success() {
+        let mut attempted = Vec::new();
+        let selected = try_auto_advance(4, Some(0), false, |index| {
+            attempted.push(index);
+            index == 3
+        });
+
+        assert_eq!(selected, Some(3));
+        assert_eq!(attempted, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn auto_advance_does_not_wrap_or_retry_an_entry_when_all_fail() {
+        let mut attempted = Vec::new();
+        let selected = try_auto_advance(3, Some(0), false, |index| {
+            attempted.push(index);
+            false
+        });
+
+        assert_eq!(selected, None);
+        assert_eq!(attempted, vec![1, 2]);
+    }
+
 }

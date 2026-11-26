@@ -118,12 +118,21 @@ pub fn render_main_window(
     );
 
     // Classic Winamp menu button: click the logo in the top-left titlebar
-    let menu_rect = Rect::from_min_size(state.position + Vec2::new(11.0, 3.0), Vec2::new(26.0, 9.0));
+    let menu_rect = Rect::from_min_size(state.position + Vec2::new(11.0, 3.0), Vec2::new(31.0, 9.0));
     let menu_resp = ui.allocate_rect(menu_rect, Sense::click());
+    menu_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Main menu (F10)"));
     if menu_resp.clicked() {
         state.menu_open = !state.menu_open;
         state.menu_frames = 0;
     }
+    // Small chevron so the trigger is discoverable (not a hidden hotspot).
+    painter.text(
+        Pos2::new(state.position.x + 39.0, state.position.y + 7.5),
+        egui::Align2::CENTER_CENTER,
+        "▾",
+        egui::FontId::new(7.0, egui::FontFamily::Proportional),
+        if menu_resp.hovered() || menu_resp.has_focus() || state.menu_open { Color32::WHITE } else { Color32::from_gray(150) },
+    );
 
     // Minimize button (x: 244, y: 3, 9x9)
     let min_rect = Rect::from_min_size(state.position + Vec2::new(244.0, 3.0), Vec2::new(9.0, 9.0));
@@ -295,14 +304,16 @@ pub fn render_main_window(
         "WINAMP (R) 5.92 LINUX RUST PORT - IT REALLY WHIPS THE LLAMA'S ASS!   ***   ".to_string()
     };
 
-    if state.last_marquee_tick.elapsed() >= Duration::from_millis(140) {
-        state.marquee_offset = (state.marquee_offset + 1) % title_text.len().max(1);
+    // Index the marquee by Unicode scalar values, not UTF-8 bytes: ID3 titles
+    // routinely contain accented letters and other multibyte characters.
+    let chars: Vec<char> = title_text.chars().collect();
+    if audio.is_playing() && state.last_marquee_tick.elapsed() >= Duration::from_millis(140) {
+        state.marquee_offset = (state.marquee_offset + 1) % chars.len().max(1);
         state.last_marquee_tick = std::time::Instant::now();
     }
 
     // Render characters from marquee using TEXT.BMP bitmap font
     let visible_chars = 30;
-    let chars: Vec<char> = title_text.chars().collect();
     for i in 0..visible_chars {
         let char_idx = (state.marquee_offset + i) % chars.len();
         let ch = chars[char_idx];

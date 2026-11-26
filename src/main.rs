@@ -1,10 +1,5 @@
-pub mod skin;
-pub mod audio;
-pub mod config;
-pub mod ui;
-
 use eframe::NativeOptions;
-use ui::WinampApp;
+use retroamp::ui::WinampApp;
 
 const ICON_RAW: &[u8] = include_bytes!("../assets/icons/retroamp-48.png");
 

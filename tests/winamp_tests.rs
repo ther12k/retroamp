@@ -23,15 +23,22 @@ fn test_embedded_skin_loads() {
 #[cfg(feature = "egui-ui")]
 #[test]
 fn test_skin_loader_safety_and_validation() {
-    // 1. Loading non-existent file must return Err
     assert!(Skin::load_wsz("non_existent_file.wsz").is_err());
 
-    // 2. Loading custom matrix.wsz must succeed
-    let wsz_path = Path::new("assets/skins/matrix.wsz");
-    if wsz_path.exists() {
-        let skin = Skin::load_wsz(wsz_path).expect("Failed to load matrix.wsz");
-        assert_eq!(skin.name, "matrix");
-        assert_eq!(skin.main.size, [275, 116]);
+    let wsz_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/skins/matrix.wsz");
+    let skin = Skin::load_wsz(wsz_path).expect("Failed to load matrix.wsz");
+    assert_eq!(skin.name, "matrix");
+    assert_eq!(skin.main.size, [275, 116]);
+}
+
+#[cfg(feature = "egui-ui")]
+#[test]
+fn test_skin_image_dimension_limit() {
+    for (width, accepted) in [(2048, true), (2049, false)] {
+        let sample = image::GrayImage::new(width, 1);
+        let mut png = std::io::Cursor::new(Vec::new());
+        sample.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert_eq!(retroamp::skin::decode_image(png.get_ref()).is_some(), accepted);
     }
 }
 
@@ -40,15 +47,12 @@ fn test_biquad_eq_dsp_processing() {
     let fs = 44100.0;
     let f0 = 1000.0;
 
-    // Create a +6dB peaking filter at 1kHz
     let mut boost_filter = BiquadFilter::new_peaking(6.0, f0, fs, 1.414);
-    // Create a -6dB peaking filter at 1kHz
     let mut cut_filter = BiquadFilter::new_peaking(-6.0, f0, fs, 1.414);
 
     let mut boost_energy = 0.0f32;
     let mut cut_energy = 0.0f32;
 
-    // Generate 1000 samples of a 1kHz sine wave
     for i in 0..1000 {
         let t = i as f32 / fs;
         let x = (2.0 * std::f32::consts::PI * f0 * t).sin();
@@ -56,14 +60,12 @@ fn test_biquad_eq_dsp_processing() {
         let y_boost = boost_filter.process(x);
         let y_cut = cut_filter.process(x);
 
-        // Discard initial transient (first 200 samples)
         if i >= 200 {
             boost_energy += y_boost * y_boost;
             cut_energy += y_cut * y_cut;
         }
     }
 
-    // Boosted signal must have significantly more energy than cut signal (~4x power difference for 12dB spread)
     assert!(
         boost_energy > cut_energy * 2.5,
         "Boost energy ({boost_energy}) should be significantly greater than cut energy ({cut_energy})"
