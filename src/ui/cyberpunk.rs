@@ -55,7 +55,8 @@ pub fn render_cyberpunk_main(
     // [≡] Main Menu button
     let menu_btn = Rect::from_min_size(state.position + Vec2::new(6.0, 2.0), Vec2::new(16.0, 12.0));
     let menu_resp = ui.allocate_rect(menu_btn, Sense::click());
-    painter.text(menu_btn.center(), egui::Align2::CENTER_CENTER, "[≡]", FontId::new(8.0, FontFamily::Monospace), if menu_resp.hovered() || state.menu_open { Color32::WHITE } else { PHOSPHOR_GREEN });
+    menu_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Main menu (F10)"));
+    painter.text(menu_btn.center(), egui::Align2::CENTER_CENTER, "[≡]", FontId::new(8.0, FontFamily::Monospace), if menu_resp.hovered() || menu_resp.has_focus() || state.menu_open { Color32::WHITE } else { PHOSPHOR_GREEN });
     if menu_resp.clicked() {
         state.menu_open = !state.menu_open;
         state.menu_frames = 0;
@@ -93,10 +94,15 @@ pub fn render_cyberpunk_main(
     painter.rect_stroke(term_rect, 1.0, Stroke::new(1.0_f32, PHOSPHOR_DIM), egui::StrokeKind::Inside);
 
     // Track command line
+    let playback_label = match audio.state {
+        PlaybackState::Playing => "PLAY",
+        PlaybackState::Paused => "PAUSED",
+        PlaybackState::Stopped => "STOPPED",
+    };
     let title_line = if let Some(ref track) = audio.current_track {
-        format!("> PLAY: {} [{}]", track.title, track.artist)
+        format!("> {playback_label}: {} [{}]", track.title, track.artist)
     } else {
-        "> DAEMON: READY -- NO STREAM ATTACHED".to_string()
+        "> DAEMON: READY — NO STREAM ATTACHED".to_string()
     };
     painter.text(term_rect.min + Vec2::new(6.0, 4.0), egui::Align2::LEFT_TOP, &title_line, FontId::new(9.5, FontFamily::Monospace), PHOSPHOR_GREEN);
 
@@ -301,6 +307,7 @@ pub fn render_cyberpunk_eq(
     painter.text(presets_btn.center(), egui::Align2::CENTER_CENTER, "[PRESETS]", FontId::new(8.0, FontFamily::Monospace), if presets_resp.hovered() || state.show_presets { Color32::WHITE } else { PHOSPHOR_DIM });
     if presets_resp.clicked() {
         state.show_presets = !state.show_presets;
+        state.presets_frames = 0;
     }
 
     // Preamp slider (x: 10, y: 38, h: 62)
@@ -472,14 +479,7 @@ pub fn render_cyberpunk_playlist(
         state.position + Vec2::new(PL_DEFAULT_WIDTH - 21.0, state.height),
     );
     let grip_resp = ui.allocate_rect(grip_rect, Sense::drag());
-    grip_resp.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
-    if grip_resp.dragged() {
-        const CHROME: f32 = 58.0;
-        const ROW_H: f32 = 14.0;
-        let rows = ((state.height - CHROME) / ROW_H).round();
-        let new_rows = (rows + grip_resp.drag_delta().y / ROW_H).clamp(2.0, 64.0);
-        state.height = CHROME + new_rows * ROW_H;
-    }
+    state.resize_from_grip(&grip_resp, 14.0);
 
     action
 }

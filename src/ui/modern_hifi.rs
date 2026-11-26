@@ -50,7 +50,8 @@ pub fn render_hifi_main(
     // ☰ Main Menu button (left of title)
     let menu_rect = Rect::from_min_size(state.position + Vec2::new(6.0, 2.0), Vec2::new(14.0, 14.0));
     let menu_resp = ui.allocate_rect(menu_rect, Sense::click());
-    if menu_resp.hovered() || state.menu_open {
+    menu_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Main menu (F10)"));
+    if menu_resp.hovered() || menu_resp.has_focus() || state.menu_open {
         painter.rect_filled(menu_rect, 3.0, BTN_HOVER);
     }
     painter.text(
@@ -412,10 +413,12 @@ pub fn render_hifi_eq(
     painter.text(presets_btn.center(), egui::Align2::CENTER_CENTER, "PRESETS", FontId::new(8.5, FontFamily::Proportional), if state.show_presets { ACCENT_CYAN } else { Color32::WHITE });
     if presets_resp.clicked() {
         state.show_presets = !state.show_presets;
+        state.presets_frames = 0;
     }
 
-    // Studio Curve Graph (x: 48, y: 20, w: 218, h: 22)
-    let graph_rect = Rect::from_min_size(state.position + Vec2::new(48.0, 20.0), Vec2::new(218.0, 22.0));
+    // Studio Curve Graph — starts right of the PRESETS button (x: 112..266)
+    // so the filled graph can never cover the clickable button.
+    let graph_rect = Rect::from_min_size(state.position + Vec2::new(112.0, 20.0), Vec2::new(154.0, 22.0));
     painter.rect_filled(graph_rect, 3.0, OLED_BG);
     painter.rect_stroke(graph_rect, 3.0, Stroke::new(1.0_f32, Color32::from_rgb(30, 36, 46)), egui::StrokeKind::Inside);
 
@@ -619,14 +622,7 @@ pub fn render_hifi_playlist(
         state.position + Vec2::new(PL_DEFAULT_WIDTH - 21.0, state.height),
     );
     let grip_resp = ui.allocate_rect(grip_rect, Sense::drag());
-    grip_resp.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
-    if grip_resp.dragged() {
-        const CHROME: f32 = 58.0;
-        const ROW_H: f32 = 18.0;
-        let rows = ((state.height - CHROME) / ROW_H).round();
-        let new_rows = (rows + grip_resp.drag_delta().y / ROW_H).clamp(2.0, 64.0);
-        state.height = CHROME + new_rows * ROW_H;
-    }
+    state.resize_from_grip(&grip_resp, 18.0);
 
     action
 }

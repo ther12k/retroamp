@@ -19,12 +19,11 @@ const EDGE_LIGHT: Color32 = Color32::from_rgb(84, 96, 134);
 const EDGE_DARK: Color32 = Color32::from_rgb(8, 11, 20);
 const LCD_BG: Color32 = Color32::from_rgb(0, 0, 0);
 const LED_GREEN: Color32 = Color32::from_rgb(0, 232, 0);
-const LED_DIM: Color32 = Color32::from_rgb(0, 96, 0);
-const LED_AMBER: Color32 = Color32::from_rgb(255, 176, 0);
+const LED_DIM: Color32 = Color32::from_rgb(0, 132, 0);
+const LED_LABEL: Color32 = Color32::from_rgb(97, 198, 97);
 const BTN_TOP: Color32 = Color32::from_rgb(158, 164, 178);
 const BTN_BOT: Color32 = Color32::from_rgb(104, 110, 126);
 const BTN_GLYPH: Color32 = Color32::from_rgb(24, 28, 38);
-const GOLD: Color32 = Color32::from_rgb(208, 178, 88);
 
 fn vgrad(painter: &egui::Painter, rect: Rect, top: Color32, bot: Color32, rounding: f32) {
     painter.rect_filled(rect, rounding, top);
@@ -176,9 +175,19 @@ pub fn render_vector_main(ui: &mut Ui, state: &mut MainWindowState, audio: &mut 
     if titlebar_resp.drag_started() { state.os_drag_started = true; }
     titlebar(&painter, tb, "W I N A M P");
 
-    let menu_rect = Rect::from_min_size(pos + Vec2::new(10.0, 2.0), Vec2::new(26.0, 10.0));
+    let menu_rect = Rect::from_min_size(pos + Vec2::new(10.0, 2.0), Vec2::new(30.0, 10.0));
     let menu_resp = ui.allocate_rect(menu_rect, Sense::click());
+    menu_resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Main menu (F10)"));
     if menu_resp.clicked() { state.menu_open = !state.menu_open; state.menu_frames = 0; }
+    // Visible affordance: the wordmark is the menu trigger, so hint it with a
+    // chevron that lights up on hover instead of leaving a hidden hotspot.
+    painter.text(
+        pos + Vec2::new(38.0, 7.0),
+        Align2::CENTER_CENTER,
+        "▾",
+        FontId::new(8.0, FontFamily::Proportional),
+        if menu_resp.hovered() || menu_resp.has_focus() || state.menu_open { Color32::WHITE } else { Color32::from_rgb(150, 158, 180) },
+    );
 
     // Minimize / Close (vector: _ and x glyphs on beveled mini-buttons)
     let min_rect = Rect::from_min_size(pos + Vec2::new(243.0, 2.0), Vec2::new(10.0, 10.0));
@@ -229,7 +238,7 @@ pub fn render_vector_main(ui: &mut Ui, state: &mut MainWindowState, audio: &mut 
     } else {
         "WINAMP REDRAWN - IT REALLY WHIPS THE LLAMA'S ASS!   ***   ".to_string()
     };
-    if state.last_marquee_tick.elapsed() >= Duration::from_millis(160) {
+    if audio.is_playing() && state.last_marquee_tick.elapsed() >= Duration::from_millis(160) {
         state.marquee_offset = (state.marquee_offset + 1) % title_text.chars().count().max(1);
         state.last_marquee_tick = std::time::Instant::now();
     }
@@ -249,13 +258,22 @@ pub fn render_vector_main(ui: &mut Ui, state: &mut MainWindowState, audio: &mut 
         painter.rect_filled(r, 0.0, LCD_BG);
         painter.text(r.min + Vec2::new(2.0, 0.5), Align2::LEFT_TOP, &text, FontId::new(8.0, FontFamily::Monospace), LED_GREEN);
     }
-    painter.text(pos + Vec2::new(136.0, 43.0), Align2::LEFT_TOP, "kbps", FontId::new(7.0, FontFamily::Proportional), LED_DIM);
-    painter.text(pos + Vec2::new(174.0, 43.0), Align2::LEFT_TOP, "kHz", FontId::new(7.0, FontFamily::Proportional), LED_DIM);
+    painter.text(pos + Vec2::new(136.0, 43.0), Align2::LEFT_TOP, "kbps", FontId::new(7.0, FontFamily::Proportional), LED_LABEL);
+    painter.text(pos + Vec2::new(174.0, 43.0), Align2::LEFT_TOP, "kHz", FontId::new(7.0, FontFamily::Proportional), LED_LABEL);
 
     // Mono / Stereo indicators
     let stereo = audio.current_track.as_ref().map(|t| t.channels >= 2).unwrap_or(true);
-    painter.text(pos + Vec2::new(213.0, 42.0), Align2::LEFT_TOP, "MONO", FontId::new(8.0, FontFamily::Proportional), if !stereo { LED_GREEN } else { LED_DIM });
-    painter.text(pos + Vec2::new(240.0, 42.0), Align2::LEFT_TOP, "STEREO", FontId::new(8.0, FontFamily::Proportional), if stereo { LED_GREEN } else { LED_DIM });
+    painter.text(pos + Vec2::new(213.0, 42.0), Align2::LEFT_TOP, "MONO", FontId::new(8.0, FontFamily::Proportional), if !stereo { LED_GREEN } else { LED_LABEL });
+    painter.text(pos + Vec2::new(240.0, 42.0), Align2::LEFT_TOP, "STEREO", FontId::new(8.0, FontFamily::Proportional), if stereo { LED_GREEN } else { LED_LABEL });
+    let active_channel_x = if stereo { 240.0 } else { 213.0 };
+    let active_channel_width = if stereo { 27.0 } else { 19.0 };
+    painter.line_segment(
+        [
+            pos + Vec2::new(active_channel_x, 50.0),
+            pos + Vec2::new(active_channel_x + active_channel_width, 50.0),
+        ],
+        Stroke::new(1.0_f32, LED_GREEN),
+    );
 
     // Visualizer (24,53,76x16)
     let vis_rect = Rect::from_min_size(pos + Vec2::new(24.0, 53.0), Vec2::new(76.0, 16.0));
@@ -393,7 +411,7 @@ pub fn render_vector_eq(ui: &mut Ui, state: &mut EqWindowState, audio: &mut Audi
     // PRESETS (204,18)
     let presets_rect = Rect::from_min_size(pos + Vec2::new(204.0, 18.0), Vec2::new(58.0, 13.0));
     let presets_resp = ui.allocate_rect(presets_rect, Sense::click());
-    if presets_resp.clicked() { state.show_presets = !state.show_presets; }
+    if presets_resp.clicked() { state.show_presets = !state.show_presets; state.presets_frames = 0; }
     bevel(&painter, presets_rect, presets_resp.is_pointer_button_down_on() || state.show_presets, 2.0);
     painter.text(presets_rect.center(), Align2::CENTER_CENTER, "PRESETS", FontId::new(8.0, FontFamily::Proportional), BTN_GLYPH);
 
@@ -528,8 +546,26 @@ pub fn render_vector_playlist(
 
         if selected {
             painter.rect_filled(row, 0.0, Color32::from_rgb(0, 0, 128));
+        } else if playing {
+            painter.rect_filled(row, 0.0, Color32::from_rgb(0, 48, 16));
         }
         let resp = ui.allocate_rect(row, Sense::click());
+        resp.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::WidgetType::Button,
+                true,
+                selected,
+                &entry.title,
+            )
+        });
+        if resp.has_focus() {
+            painter.rect_stroke(
+                row.shrink(0.5),
+                0.0,
+                Stroke::new(1.0_f32, Color32::YELLOW),
+                egui::StrokeKind::Inside,
+            );
+        }
         if resp.clicked() { state.selected_index = Some(entry_idx); }
         if resp.double_clicked() { action = PlaylistAction::PlayIndex(entry_idx); }
 
@@ -566,13 +602,7 @@ pub fn render_vector_playlist(
         pos + Vec2::new(PL_DEFAULT_WIDTH - 21.0, state.height),
     );
     let grip_resp = ui.allocate_rect(grip, Sense::drag());
-    grip_resp.clone().on_hover_cursor(egui::CursorIcon::ResizeVertical);
-    if grip_resp.dragged() {
-        const CHROME: f32 = 58.0;
-        const ROW_H: f32 = 13.0;
-        let rows = ((state.height - CHROME) / ROW_H).round();
-        state.height = CHROME + (rows + grip_resp.drag_delta().y / ROW_H).clamp(2.0, 64.0) * ROW_H;
-    }
+    state.resize_from_grip(&grip_resp, 13.0);
 
     action
 }

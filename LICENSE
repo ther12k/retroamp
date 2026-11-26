@@ -26,3 +26,13 @@ Note: RetroAmp is an independent, clean-room homage inspired by the classic
 Winamp player. It is not affiliated with, endorsed by, or derived from
 Nullsoft / Winamp SA. "Winamp" is a trademark of its respective owners and is
 referenced here only nominatively to describe compatibility and inspiration.
+
+The MIT license above applies to RetroAmp software source only. It does not
+grant rights to the original Winamp installer or its installer artwork. The
+embedded classic skin artwork, including MAIN, EQMAIN, and PLEDIT, came from
+the original Winamp installer; permission to redistribute it has not been
+verified. The provenance and redistribution permissions of the other bundled
+skins, icons, and artwork have also not been verified. This notice is not
+clearance or a license. Do not distribute binaries containing these assets
+until the applicable rights are verified or the assets are replaced with
+properly licensed artwork.

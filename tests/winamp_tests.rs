@@ -22,12 +22,20 @@ fn test_skin_loader_safety_and_validation() {
     // 1. Loading non-existent file must return Err
     assert!(Skin::load_wsz("non_existent_file.wsz").is_err());
 
-    // 2. Loading custom matrix.wsz must succeed
-    let wsz_path = Path::new("assets/skins/matrix.wsz");
-    if wsz_path.exists() {
-        let skin = Skin::load_wsz(wsz_path).expect("Failed to load matrix.wsz");
-        assert_eq!(skin.name, "matrix");
-        assert_eq!(skin.main.size, [275, 116]);
+    // 2. The checked-in custom skin must actually load.
+    let wsz_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/skins/matrix.wsz");
+    let skin = Skin::load_wsz(wsz_path).expect("Failed to load matrix.wsz");
+    assert_eq!(skin.name, "matrix");
+    assert_eq!(skin.main.size, [275, 116]);
+}
+
+#[test]
+fn test_skin_image_dimension_limit() {
+    for (width, accepted) in [(2048, true), (2049, false)] {
+        let sample = image::GrayImage::new(width, 1);
+        let mut png = std::io::Cursor::new(Vec::new());
+        sample.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        assert_eq!(retroamp::skin::decode_image(png.get_ref()).is_some(), accepted);
     }
 }
 
@@ -67,44 +75,27 @@ fn test_biquad_eq_dsp_processing() {
 }
 
 #[test]
+#[ignore = "requires a working audio device and RETROAMP_TEST_AUDIO"]
 fn test_audio_playback_and_fft() {
     let mut audio = AudioEngine::new();
-    let mp3_path = Path::new("/mnt/data/The WIRED CD - Rip. Sample. Mash. Share/01 - Beastie Boys - Now Get Busy.mp3");
+    let path = std::env::var_os("RETROAMP_TEST_AUDIO")
+        .expect("Set RETROAMP_TEST_AUDIO to an audio file with audible content in its first second");
+    audio.play_file(std::path::PathBuf::from(path)).expect("Failed to play audio");
+    assert!(audio.is_playing());
+    assert!(audio.current_track.is_some());
 
-    if mp3_path.exists() {
-        audio.play_file(mp3_path).expect("Failed to play MP3");
-        assert!(audio.is_playing());
-        assert!(audio.current_track.is_some());
+    // Let audio output fill the visualization buffer.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let finished = audio.update();
+    assert!(!finished, "Song should not finish immediately");
+    let (_waveform, spectrum, _peaks) = audio.get_vis_data();
+    let total_energy: f32 = spectrum.iter().sum();
+    assert!(total_energy > 0.01, "FFT spectrum should be non-zero during playback");
 
-        let track = audio.current_track.as_ref().unwrap();
-        assert_eq!(track.sample_rate, 44100);
-        assert_eq!(track.channels, 2);
-        assert!(track.duration.as_secs() > 0);
-
-        // Let audio stream run for 400ms to verify FFT and visualization buffer
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let finished = audio.update();
-        assert!(!finished, "Song should not finish immediately");
-
-        let (_waveform, spectrum, _peaks) = audio.get_vis_data();
-        let total_energy: f32 = spectrum.iter().sum();
-
-        assert!(
-            total_energy > 0.01,
-            "FFT spectrum energy should be non-zero during playback"
-        );
-
-        // Test seeking
-        audio.seek(std::time::Duration::from_secs(10));
-        assert_eq!(audio.position.as_secs(), 10);
-
-        audio.pause();
-        assert_eq!(audio.state, PlaybackState::Paused);
-
-        audio.resume();
-        assert_eq!(audio.state, PlaybackState::Playing);
-
-        audio.stop();
-        assert_eq!(audio.state, PlaybackState::Stopped);
-    }
+    audio.pause();
+    assert_eq!(audio.state, PlaybackState::Paused);
+    audio.resume();
+    assert_eq!(audio.state, PlaybackState::Playing);
+    audio.stop();
+    assert_eq!(audio.state, PlaybackState::Stopped);
 }

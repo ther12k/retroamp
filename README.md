@@ -32,7 +32,7 @@
 - **Full Customizability**:
   - **Playlist resizing**: Drag the bottom edge to grow/shrink track row capacity.
   - **Winamp-style scaling** — `Ctrl+D` toggles double size, `Ctrl+=`/`Ctrl+-` fine-zoom, `Ctrl+0` resets, or pick 100–300% from the menu's VIEW section. Launch big with `RETROAMP_SCALE=2 retroamp`.
-- **Persistent configuration** (`~/.config/retroamp/config.json`): UI scale, theme, playlist size (rows), volume, shuffle/repeat, EQ/Playlist visibility, and visualizer mode are remembered across launches — changed automatically, saved on exit.
+- **Persistent configuration** (`~/.config/retroamp/config.json`): UI scale, theme, playlist size (rows), volume, shuffle/repeat, EQ/Playlist visibility, visualizer mode, and the active classic skin (bundled Nord Frost or a custom skin path) are remembered across launches and saved atomically.
 - **Smooth native-feel interactions**: playlist bottom-edge resize uses relative drag accumulation (no cursor rubber-banding), and the main titlebar drag is a window-manager move.
 
 ---
@@ -50,6 +50,7 @@
 | `S` | **Open Skin / Theme Selector** |
 | EQ → PRESETS | Apply classic Winamp EQ presets (Rock, Pop, Classical, Dance, Full Bass…) |
 | `☰` / titlebar logo | **Main Menu** (File · Playback · View · Scale · Themes · Help) — themed to match the skin |
+| `F10` | Open / close the main menu |
 | `Up` / `Down` | Volume up / down |
 | `Ctrl+D` | Toggle Double Size (2.0× scale) |
 | `Ctrl+=` / `Ctrl+-` | Zoom in / out (1.0×–3.0×) |
@@ -82,3 +83,9 @@ RETROAMP_SCALE=2 retroamp
 cargo run --release
 cargo test
 ```
+
+See [docs/BUILD.md](docs/BUILD.md) for build prerequisites.
+
+## Artwork and redistribution status
+
+The MIT license in [LICENSE](LICENSE) is intended to cover the RetroAmp software source only. It does not grant rights to the original Winamp installer or its installer artwork. The embedded classic skin artwork, including MAIN, EQMAIN, and PLEDIT, came from the original Winamp installer; permission to redistribute it has not been verified. The provenance and redistribution permissions of the other bundled skins, icons, and artwork have also not been verified. The repository remains public, but do not distribute binaries containing these assets until the applicable rights are verified or the assets are replaced with properly licensed artwork. This notice is not clearance or a license.
