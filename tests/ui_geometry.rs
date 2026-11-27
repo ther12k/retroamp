@@ -539,6 +539,53 @@ fn refused_skin_is_reported_on_screen_and_a_good_one_clears_the_notice() {
 /// The menu is a modal (focus stays inside it) but it must still open as a
 /// dropdown under the titlebar logo, not over the centre of the player.
 #[test]
+fn command_line_arguments_fill_the_playlist_and_report_failures() {
+    // Garbage content keeps this hermetic: metadata fails before any audio
+    // device is touched.
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("retroamp-args-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for name in ["zeta.mp3", "alpha.flac", "notes.txt"] {
+        std::fs::write(dir.join(name), b"not audio").unwrap();
+    }
+    let skin = dir.join("fake.wsz");
+    std::fs::write(&skin, b"not a zip archive").unwrap();
+
+    let mut app = OffscreenApp::new(295.0, 362.0);
+    app.app.open_paths(&[dir.clone(), skin]);
+
+    let titles: Vec<&str> = app
+        .app
+        .playlist_state
+        .items
+        .iter()
+        .map(|entry| entry.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["alpha", "zeta"],
+        "folder tracks join sorted; non-audio files are skipped"
+    );
+    let error = app
+        .app
+        .playback_error
+        .as_deref()
+        .expect("the first unplayable track is reported");
+    assert!(error.contains("alpha"), "{error}");
+    let skin_error = app
+        .app
+        .skin_error
+        .as_deref()
+        .expect("a refused skin argument is reported");
+    assert!(skin_error.contains("fake.wsz"), "{skin_error}");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn menu_drops_down_under_the_titlebar_logo() {
     let mut app = OffscreenApp::new(295.0, 362.0);
     app.press_key(egui::Key::F10);
