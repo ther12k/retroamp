@@ -45,17 +45,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # `main` does not carry the feature yet; the job only applies where the
+      # manifest declares it.
+      - id: detect
+        run: echo "present=$(grep -q 'gpui-ui' Cargo.toml && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
       - name: Install native build prerequisites
+        if: steps.detect.outputs.present == 'true'
         run: |
           # See the note in the `test` job about the Microsoft repo 403s.
           sudo apt-get update || echo "apt-get update had failures; continuing"
           sudo apt-get install --no-install-recommends -y build-essential pkg-config libasound2-dev libfontconfig1-dev
 
       - name: Install Rust
+        if: steps.detect.outputs.present == 'true'
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
       - name: Run locked tests for the GPUI frontend
+        if: steps.detect.outputs.present == 'true'
         run: cargo test --locked --no-default-features --features gpui-ui
 
       - name: Build the GPUI binary
+        if: steps.detect.outputs.present == 'true'
         run: cargo build --locked --no-default-features --features gpui-ui --bin retroamp-gpui
