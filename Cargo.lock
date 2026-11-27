@@ -5554,6 +5554,7 @@ dependencies = [
  "fastrand 2.5.0",
  "gpui",
  "image",
+ "libc",
  "log",
  "parking_lot",
  "rfd",

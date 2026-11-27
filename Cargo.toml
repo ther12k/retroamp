@@ -9,7 +9,10 @@ default-run = "retroamp"
 [features]
 default = ["egui-ui"]
 egui-ui = ["dep:eframe", "dep:egui", "dep:image", "dep:zip", "dep:rfd", "dep:fastrand"]
-gpui-ui = ["dep:gpui"]
+# gpui 0.2.2 pulls xattr 0.2.3, which reads `libc::ENOATTR`; libc dropped that constant
+# on Linux in 0.2.190. Pinning libc in the manifest keeps `cargo update` from lifting it.
+# The resolver then has to hold mio at <= 1.2.4, which still accepts libc 0.2.189.
+gpui-ui = ["dep:gpui", "dep:libc"]
 
 [[bin]]
 name = "retroamp"
@@ -30,6 +33,7 @@ required-features = ["egui-ui"]
 eframe = { version = "0.31", optional = true, default-features = false, features = ["default_fonts", "glow", "x11"] }
 egui = { version = "0.31", optional = true }
 gpui = { version = "=0.2.2", optional = true }
+libc = { version = "=0.2.189", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png", "bmp"] }
 zip = { version = "2.2", optional = true, default-features = false, features = ["deflate"] }
 rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-mp3", "symphonia-flac", "symphonia-wav", "symphonia-vorbis", "symphonia-aac"] }

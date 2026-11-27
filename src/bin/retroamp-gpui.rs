@@ -444,7 +444,7 @@ impl Render for Player {
                                     .child(format!("{} / {duration}", clock(self.audio.position))),
                             ),
                     )
-                    .child(div().text_lg().child(title))
+                    .child(div().text_lg().truncate().child(title))
                     .when_some(artist, |display, artist| {
                         display.child(div().text_color(rgb(MUTED)).child(artist))
                     })
@@ -517,7 +517,8 @@ impl Render for Player {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(div().text_color(rgb(0xffc8a8)).child(e))
+                        // A long reason must not grow this block into the playlist's space.
+                        .child(div().text_color(rgb(0xffc8a8)).line_clamp(2).child(e))
                         .child(
                             div()
                                 .text_color(rgb(MUTED))
@@ -610,11 +611,14 @@ fn main() {
             }
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(460.), px(380.)), cx);
+        // Header, LCD panel, transport, playlist heading and key hints take about 305 px,
+        // plus about 52 px while an error is shown. Rows are 32 px, so these heights keep
+        // roughly 5 rows visible at the default size and at least 2 at the minimum.
+        let bounds = Bounds::centered(None, size(px(460.), px(480.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(380.), px(300.))),
+                window_min_size: Some(size(px(380.), px(440.))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("RetroAmp · GPUI".into()),
                     ..Default::default()
