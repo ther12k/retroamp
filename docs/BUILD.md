@@ -20,3 +20,13 @@ The default tests run without a display or audio device. The playback smoke test
 ```sh
 RETROAMP_TEST_AUDIO=/absolute/path/to/audio cargo test --locked test_audio_playback_and_fft -- --ignored
 ```
+
+## Running
+
+The Open dialog (audio files and `.wsz` skins) uses the XDG desktop portal rather than a bundled widget toolkit. On Ubuntu 24.04 a GNOME desktop already has it; on a minimal window manager install it explicitly:
+
+```sh
+sudo apt-get install --no-install-recommends xdg-desktop-portal xdg-desktop-portal-gtk
+```
+
+Without a portal the dialog cannot open. Audio files can still be dragged onto the player window from a file manager.

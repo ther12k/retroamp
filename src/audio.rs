@@ -227,18 +227,17 @@ impl AudioEngine {
         path: P,
         cancellation: &AtomicBool,
     ) -> Result<(), String> {
-        let path_buf = path.as_ref().to_path_buf();
+        decode_guarded("Unable to decode the file", || {
+            self.load_file(path.as_ref(), cancellation)
+        })
+    }
+
+    fn load_file(&mut self, path: &Path, cancellation: &AtomicBool) -> Result<(), String> {
+        let path_buf = path.to_path_buf();
         self.stop();
 
-        if self.sink_handle.is_none() {
-            if let Ok(handle) = DeviceSinkBuilder::open_default_sink() {
-                self.sink_handle = Some(handle);
-            }
-        }
-
-        let sink_handle = self.sink_handle.as_ref().ok_or("No audio output device available")?;
-
-        // Read metadata using Symphonia
+        // Read metadata using Symphonia. An unplayable file is rejected before
+        // the output device is touched.
         let mut metadata = extract_metadata(&path_buf)?;
 
         // Open audio file for decoding
@@ -271,6 +270,14 @@ impl AudioEngine {
 
         let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
         let channels = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(2);
+
+        if self.sink_handle.is_none() {
+            if let Ok(handle) = DeviceSinkBuilder::open_default_sink() {
+                self.sink_handle = Some(handle);
+            }
+        }
+
+        let sink_handle = self.sink_handle.as_ref().ok_or("No audio output device available")?;
 
         let is_finished = Arc::new(AtomicBool::new(false));
         let shared_params = Arc::new(Mutex::new(AudioParams {
@@ -405,7 +412,12 @@ impl AudioEngine {
             }
         }
 
-        self.process_visualization();
+        // Paused: keep the last live frame on screen. Decaying it here would only
+        // advance on the few frames an idle UI still runs, leaving the display to
+        // sag whenever the pointer moves. Stopping clears it in `stop`.
+        if self.state == PlaybackState::Playing {
+            self.process_visualization();
+        }
         track_finished
     }
 
@@ -505,8 +517,22 @@ impl AudioEngine {
     }
 }
 
+/// Run decoder setup and turn a panic inside the decoder into an error, so one
+/// malformed file cannot take the player down. Symphonia is meant never to
+/// panic on bad input, but its RIFF reader panics on a zero sample rate (0.5.x).
+fn decode_guarded<T>(context: &str, run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(_) => Err(format!("{context}: the decoder rejected the file's header")),
+    }
+}
+
 /// Helper: Extract ID3 and format metadata from audio file
 fn extract_metadata(path: &Path) -> Result<TrackMetadata, String> {
+    decode_guarded("Unable to read audio metadata", || read_metadata(path))
+}
+
+fn read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -528,11 +554,17 @@ fn extract_metadata(path: &Path) -> Result<TrackMetadata, String> {
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or("No audio track")?;
 
-    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let sample_rate = track
+        .codec_params
+        .sample_rate
+        .filter(|rate| *rate > 0)
+        .unwrap_or(44100);
     let channels = track.codec_params.channels.map(|c| c.count() as u16).unwrap_or(2);
 
-    let duration = if let Some(n_frames) = track.codec_params.n_frames {
-        Duration::from_secs_f64(n_frames as f64 / sample_rate as f64)
+        // A header may claim an absurd frame count; treat one that overflows as unknown.
+        let duration = if let Some(n_frames) = track.codec_params.n_frames {
+            Duration::try_from_secs_f64(n_frames as f64 / sample_rate as f64)
+                .unwrap_or(Duration::ZERO)
     } else {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let bitrate_bps = 128_000;
@@ -1020,6 +1052,56 @@ mod framing_tests {
             wav.extend_from_slice(&sample.to_le_bytes());
         }
         wav
+    }
+
+    /// Symphonia's RIFF reader panics on a zero sample rate. It must surface as
+    /// an ordinary playback error, before any output device is opened.
+    #[test]
+    fn a_zero_sample_rate_header_is_an_error_not_a_crash() {
+        let mut bytes = wav(1, 64);
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes()); // the fmt chunk's sample rate
+        let path = std::env::temp_dir().join(format!(
+            "retroamp-zero-rate-{}.wav",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let error = extract_metadata(&path)
+            .expect_err("a corrupt sample-rate field must be reported, not accepted");
+        assert!(error.contains("decoder rejected"), "{error}");
+
+        let mut engine = AudioEngine::new();
+        let error = engine
+            .play_file(&path)
+            .expect_err("the engine must refuse the file without panicking");
+        let _ = std::fs::remove_file(&path);
+        assert!(error.contains("decoder rejected"), "{error}");
+        assert_eq!(engine.state, PlaybackState::Stopped);
+        assert!(engine.player.is_none());
+    }
+
+    #[test]
+    fn paused_engine_holds_its_last_frame_while_idle_frames_run() {
+        let mut engine = AudioEngine::new();
+        {
+            let mut vis = engine.vis_data.lock();
+            vis.spectrum[0] = 0.8;
+            vis.spectrum_peaks[0] = 0.9;
+            vis.waveform[0] = 0.5;
+        }
+
+        engine.state = PlaybackState::Paused;
+        for _ in 0..10 {
+            assert!(!engine.update());
+        }
+        let (waveform, spectrum, peaks) = engine.get_vis_data();
+        assert_eq!((waveform[0], spectrum[0], peaks[0]), (0.5, 0.8, 0.9));
+
+        // Playing with no samples arriving must still fall back to idle decay.
+        engine.state = PlaybackState::Playing;
+        engine.update();
+        let (waveform, spectrum, peaks) = engine.get_vis_data();
+        assert!(waveform[0] < 0.5 && spectrum[0] < 0.8 && peaks[0] < 0.9);
     }
 
     /// Decode a file through the player's actual source, the same way

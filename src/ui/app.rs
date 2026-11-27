@@ -46,6 +46,12 @@ impl UiTheme {
     }
 }
 
+/// The config is written this long after the last change that dirtied it.
+const MIN_CONFIG_SAVE_INTERVAL: Duration = Duration::from_millis(800);
+/// Failed saves back off up to this interval rather than retrying forever at
+/// the normal rate.
+const MAX_CONFIG_SAVE_INTERVAL: Duration = Duration::from_secs(60);
+
 fn persistable_skin_path(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -83,6 +89,8 @@ pub struct WinampApp {
     pub playlist_state: PlaylistWindowState,
     pub current_track_index: Option<usize>,
     pub playback_error: Option<String>,
+    /// Why the last opened or dropped skin was refused, if it was.
+    pub skin_error: Option<String>,
     pub snap_distance: f32,
     pub eq_docked: bool,
     pub pl_docked: bool,
@@ -99,6 +107,9 @@ pub struct WinampApp {
     pub config_cache: AppConfig,
     pub config_dirty: bool,
     pub last_config_save: Instant,
+    /// How long to wait before saving a dirty config. Doubles after each failed
+    /// save, so an unwritable config location cannot keep an idle UI awake.
+    pub config_save_interval: Duration,
 }
 
 /// Colors so popup dialogs blend with the active theme's look.
@@ -315,6 +326,7 @@ impl WinampApp {
             playlist_state,
             current_track_index: None,
             playback_error: None,
+            skin_error: None,
             snap_distance: 12.0,
             eq_docked: true,
             pl_docked: true,
@@ -326,6 +338,7 @@ impl WinampApp {
             config_cache,
             config_dirty: false,
             last_config_save: Instant::now(),
+            config_save_interval: MIN_CONFIG_SAVE_INTERVAL,
         }
     }
 
@@ -441,6 +454,7 @@ impl WinampApp {
                 Ok(new_skin) => {
                     self.skin = new_skin;
                     self.active_theme = UiTheme::ClassicWinamp;
+                    self.skin_error = None;
                     if let Some(ref mut textures) = self.textures {
                         textures.update(&self.skin);
                     }
@@ -450,6 +464,13 @@ impl WinampApp {
                 }
                 Err(e) => {
                     log::error!("Failed to load skin {}: {e}", path.display());
+                    let name = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.skin_error = Some(format!(
+                        "‘{name}’ was not loaded: {e}. Choose another .wsz file."
+                    ));
                 }
             }
         } else {
@@ -471,6 +492,43 @@ impl WinampApp {
                 self.play_track_index(new_idx);
             }
         }
+    }
+
+    /// A notice pinned above the bottom edge of the host window. Returns true
+    /// once the reader dismisses it.
+    fn show_notice(
+        ctx: &Context,
+        id: &'static str,
+        heading: &str,
+        message: &str,
+        palette: &MenuPalette,
+    ) -> bool {
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new(id))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
+            .show(ctx, |ui| {
+                egui::Frame::window(&ctx.style())
+                    .fill(palette.frame_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, palette.frame_stroke))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        // The default host is 295pt wide. A notice wider than
+                        // its host is centred on it and clipped on both sides,
+                        // so stay inside it whatever the zoom or layout.
+                        ui.set_max_width((ctx.screen_rect().width() - 32.0).clamp(120.0, 360.0));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(heading).strong().color(palette.accent),
+                            );
+                            if ui.small_button("Dismiss").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                        ui.label(egui::RichText::new(message).color(palette.text));
+                    });
+            });
+        dismiss
     }
 
     /// Snap windows together and track bidirectional magnetic docking status
@@ -847,13 +905,23 @@ impl App for WinampApp {
 
             let menu_pos = self.main_state.position + egui::vec2(8.0, 20.0);
             let menu_id = egui::Id::new("retroamp-main-menu");
+            // `Modal::default_area` also anchors the popup to the screen centre,
+            // and egui lets an anchor override a fixed position. Rebuild it
+            // without one so the menu drops down under the titlebar logo while
+            // keeping the modal's focus containment and backdrop.
+            let menu_area = egui::Area::new(menu_id)
+                .kind(egui::UiKind::Modal)
+                .sense(egui::Sense::hover())
+                .order(egui::Order::Foreground)
+                .interactable(true)
+                .fixed_pos(menu_pos);
             // The full item list is ~520pt tall — taller than the default
             // 362pt stack. Cap the popup to the space below its anchor and
             // scroll inside, so it can never spill past the viewport.
             let menu_max_h =
                 (ctx.input(|i| i.screen_rect().bottom()) - menu_pos.y - 14.0).max(1.0);
             let menu_win = egui::Modal::new(menu_id)
-                .area(egui::Modal::default_area(menu_id).fixed_pos(menu_pos))
+                .area(menu_area)
                 .backdrop_color(Color32::TRANSPARENT)
                 .frame(
                     egui::Frame::window(&ctx.style())
@@ -1234,37 +1302,30 @@ impl App for WinampApp {
             }
         }
 
-        if let Some(error) = self.playback_error.clone() {
-            let palette = MenuPalette::for_theme(self.active_theme);
-            let mut dismiss = false;
-            egui::Area::new(egui::Id::new("retroamp-playback-error"))
-                .order(egui::Order::Foreground)
-                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -8.0))
-                .show(ctx, |ui| {
-                    egui::Frame::window(&ctx.style())
-                        .fill(palette.frame_fill)
-                        .stroke(egui::Stroke::new(1.0_f32, palette.frame_stroke))
-                        .inner_margin(egui::Margin::symmetric(10, 8))
-                        .show(ui, |ui| {
-                            ui.set_max_width(360.0);
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Playback stopped")
-                                        .strong()
-                                        .color(palette.accent),
-                                );
-                                if ui.small_button("Dismiss").clicked() {
-                                    dismiss = true;
-                                }
-                            });
-                            ui.label(
-                                egui::RichText::new(error)
-                                    .color(palette.text),
-                            );
-                        });
-                });
-            if dismiss {
+        // Show one notice at a time so two never land on the same anchor; a
+        // dismissed one reveals the other on the next frame.
+        let notice = self
+            .playback_error
+            .as_deref()
+            .map(|message| ("retroamp-playback-error", "Playback stopped", message))
+            .or_else(|| {
+                self.skin_error
+                    .as_deref()
+                    .map(|message| ("retroamp-skin-error", "Skin not loaded", message))
+            });
+        if let Some((id, heading, message)) = notice
+            && Self::show_notice(
+                ctx,
+                id,
+                heading,
+                message,
+                &MenuPalette::for_theme(self.active_theme),
+            )
+        {
+            if id == "retroamp-playback-error" {
                 self.playback_error = None;
+            } else {
+                self.skin_error = None;
             }
         }
 
@@ -1274,10 +1335,16 @@ impl App for WinampApp {
         if current_cfg != self.config_cache {
             self.config_dirty = true;
         }
-        if self.config_dirty && self.last_config_save.elapsed() >= Duration::from_millis(800) {
+        if self.config_dirty && self.last_config_save.elapsed() >= self.config_save_interval {
             if current_cfg.save() {
                 self.config_cache = current_cfg;
                 self.config_dirty = false;
+                self.config_save_interval = MIN_CONFIG_SAVE_INTERVAL;
+            } else {
+                self.config_save_interval = self
+                    .config_save_interval
+                    .saturating_mul(2)
+                    .min(MAX_CONFIG_SAVE_INTERVAL);
             }
             self.last_config_save = Instant::now();
         }
@@ -1297,7 +1364,8 @@ impl App for WinampApp {
             repaint_after = Some(Duration::from_millis(16));
         }
         if self.config_dirty {
-            let remaining = Duration::from_millis(800)
+            let remaining = self
+                .config_save_interval
                 .saturating_sub(self.last_config_save.elapsed());
             repaint_after = Some(repaint_after.map_or(remaining, |delay| delay.min(remaining)));
         }
