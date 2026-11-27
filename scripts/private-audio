@@ -1,0 +1,17 @@
+#!/bin/bash
+# Start a private PulseAudio with a silent null sink and run a command against
+# it, so smoke tests never touch the desktop audio. See scripts/README.md.
+# Usage: scripts/private-audio <command...>
+set -euo pipefail
+here=$(cd "$(dirname -- "$0")" && pwd)
+run=$(mktemp -d "${TMPDIR:-/tmp}/retroamp-smoke.XXXXXX")
+export PULSE_RUNTIME_PATH="$run/runtime" PULSE_STATE_PATH="$run/state" PULSE_SERVER="unix:$run/sink.sock" ALSA_CONFIG_PATH="$here/alsa.conf"
+mkdir -m 700 "$PULSE_RUNTIME_PATH" "$PULSE_STATE_PATH"
+pulseaudio -n --daemonize=no --use-pid-file=no --exit-idle-time=-1 --log-target="file:$run/pulse.log" \
+    -L 'module-null-sink sink_name=retroamp_gpui_test' \
+    -L "module-native-protocol-unix socket=$run/sink.sock auth-anonymous=1" &
+pulse=$!
+trap 'kill "$pulse" 2>/dev/null || true; wait "$pulse" 2>/dev/null || true' EXIT
+for _ in {1..100}; do [ -S "$run/sink.sock" ] && break; sleep .05; done
+pactl set-default-sink retroamp_gpui_test
+"$@"

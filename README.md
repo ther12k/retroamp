@@ -80,6 +80,8 @@ Use a Linux desktop with a working Vulkan presentation surface, audio output, an
 
 The GPUI view renders only the visible playlist rows and polls the audio engine about 30 times per second during playback, not at idle. In a local X11 idle check on Intel RPL-P graphics, the updated egui build used a median 0.0% of one logical core and 89.9 MiB RSS; GPUI used 1.2% and 138.2 MiB. These are medians of three ten-second samples after a five-second warm-up: debug builds with the same private silent audio sink and empty queues; egui used Redrawn at 1.5× with EQ hidden. The windows and backends differ. This measures idle process cost, **not** toolkit drawing speed. Compare release builds with the same track, controls, and update rate before attributing a difference to the toolkit.
 
+An end-to-end audio check (tones in queue order, broken entry skipped) lives in `scripts/gpui-smoke.py`; see `scripts/README.md`.
+
 ## 🚀 Running RetroAmp
 
 ### From App Launcher
