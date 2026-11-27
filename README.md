@@ -73,6 +73,10 @@ Search for **RetroAmp** in your desktop application launcher / GNOME Shell.
 ```bash
 retroamp
 ```
+With tracks or a music folder (the first track starts, the rest queue; `.wsz` files load as skins):
+```bash
+retroamp track.flac ~/music
+```
 Or with an initial theme:
 ```bash
 RETROAMP_SKIN=cyberpunk retroamp

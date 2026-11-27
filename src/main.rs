@@ -1,5 +1,6 @@
 use eframe::NativeOptions;
 use retroamp::ui::WinampApp;
+use std::path::PathBuf;
 
 const ICON_RAW: &[u8] = include_bytes!("../assets/icons/retroamp-48.png");
 
@@ -17,6 +18,10 @@ fn load_window_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
+
+    // Classic Winamp launches: `retroamp track.flac` or `retroamp ~/music`.
+    // Tracks join the playlist with the first one starting; `.wsz` files load as skins.
+    let arguments: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("RetroAmp")
@@ -40,6 +45,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "RetroAmp",
         options,
-        Box::new(|cc| Ok(Box::new(WinampApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = WinampApp::new(cc);
+            app.open_paths(&arguments);
+            Ok(Box::new(app))
+        }),
     )
 }

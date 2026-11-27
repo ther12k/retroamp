@@ -59,6 +59,18 @@ fn persistable_skin_path(path: &Path) -> String {
         .into_owned()
 }
 
+/// Extensions the file dialog offers; folder arguments are filtered to the
+/// playable ones.
+const AUDIO_EXTENSIONS: [&str; 5] = ["mp3", "flac", "wav", "ogg", "aac"];
+
+fn is_audio_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
+}
+
 fn try_auto_advance(
     item_count: usize,
     current_index: Option<usize>,
@@ -475,17 +487,7 @@ impl WinampApp {
             }
         } else {
             // Add track to playlist
-            let title = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "Track".to_string());
-
-            let new_idx = self.playlist_state.items.len();
-            self.playlist_state.items.push(PlaylistEntry {
-                title,
-                path: path.clone(),
-                duration_secs: 0,
-            });
+            let new_idx = self.add_track(path);
 
             // If stopped, start playing this track
             if self.audio.state == PlaybackState::Stopped {
@@ -529,6 +531,64 @@ impl WinampApp {
                     });
             });
         dismiss
+    }
+
+    /// Add a track to the playlist without touching playback.
+    fn add_track(&mut self, path: PathBuf) -> usize {
+        let title = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Track".to_string());
+
+        let index = self.playlist_state.items.len();
+        self.playlist_state.items.push(PlaylistEntry {
+            title,
+            path: path.clone(),
+            duration_secs: 0,
+        });
+        index
+    }
+
+    /// Add files passed on the command line or dropped as a folder: audio
+    /// tracks join the playlist, `.wsz`/zip archives load as skins. Like
+    /// Winamp, the first requested track starts — later ones only queue.
+    pub fn open_paths(&mut self, paths: &[PathBuf]) {
+        let mut first_track = None;
+        for path in paths {
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if path.is_dir() {
+                let mut tracks = match std::fs::read_dir(path) {
+                    Ok(entries) => entries
+                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                        .filter(|entry| is_audio_path(entry))
+                        .collect::<Vec<PathBuf>>(),
+                    Err(error) => {
+                        log::warn!("Cannot read folder {}: {error}", path.display());
+                        continue;
+                    }
+                };
+                tracks.sort();
+                for track in tracks {
+                    let index = self.add_track(track);
+                    first_track.get_or_insert(index);
+                }
+            } else if matches!(extension.as_str(), "wsz" | "zip") {
+                self.handle_opened_file(path.clone());
+            } else if is_audio_path(path) {
+                let index = self.add_track(path.clone());
+                first_track.get_or_insert(index);
+            } else {
+                log::warn!("Ignoring {}: not an audio file or a skin", path.display());
+            }
+        }
+
+        if let Some(index) = first_track {
+            self.play_track_index(index);
+        }
     }
 
     /// Snap windows together and track bidirectional magnetic docking status

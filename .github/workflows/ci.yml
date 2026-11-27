@@ -22,7 +22,9 @@ jobs:
 
       - name: Install native build prerequisites
         run: |
-          sudo apt-get update
+          # The runner's Microsoft repo intermittently 403s; our packages come
+          # from the Ubuntu archive, so a partial update is fine.
+          sudo apt-get update || echo "apt-get update had failures; continuing"
           sudo apt-get install --no-install-recommends -y build-essential pkg-config libasound2-dev
 
       - name: Install Rust
@@ -45,7 +47,8 @@ jobs:
 
       - name: Install native build prerequisites
         run: |
-          sudo apt-get update
+          # See the note in the `test` job about the Microsoft repo 403s.
+          sudo apt-get update || echo "apt-get update had failures; continuing"
           sudo apt-get install --no-install-recommends -y build-essential pkg-config libasound2-dev libfontconfig1-dev
 
       - name: Install Rust
