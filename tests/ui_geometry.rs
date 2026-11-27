@@ -55,6 +55,9 @@ struct OffscreenApp {
     ctx: Context,
     frame: eframe::Frame,
     bounds: Rect,
+    /// Tests run against the developer's real config location, so the harness
+    /// keeps every save attempt out of reach unless a test opts in.
+    pin_last_save: bool,
 }
 
 impl OffscreenApp {
@@ -80,6 +83,7 @@ impl OffscreenApp {
             ctx,
             frame: eframe::Frame::_new_kittest(),
             bounds: Rect::from_min_size(Pos2::ZERO, vec2(width, height)),
+            pin_last_save: true,
         }
     }
 
@@ -94,7 +98,9 @@ impl OffscreenApp {
             events,
             ..Default::default()
         };
-        self.app.last_config_save = std::time::Instant::now();
+        if self.pin_last_save {
+            self.app.last_config_save = std::time::Instant::now();
+        }
         self.ctx
             .run(input, |ctx| self.app.update(ctx, &mut self.frame))
     }
@@ -309,36 +315,50 @@ fn slow_resize_accumulates_pointer_movement() {
 
 #[test]
 fn populated_playlist_resize_keeps_capture_when_visible_row_count_changes() {
-    let mut app = OffscreenApp::new(295.0, 480.0);
-    app.app.active_theme = UiTheme::ClassicWinamp;
-    app.app.playlist_state.height = 58.0 + 5.0 * 13.0;
-    app.app.playlist_state.height_unsnapped = app.app.playlist_state.height;
-    app.app.playlist_state.items = (0..10)
-        .map(|index| retroamp::ui::playlist_window::PlaylistEntry {
-            title: format!("Track {index}"),
-            path: std::path::PathBuf::from(format!("track-{index}.wav")),
-            duration_secs: 180,
-        })
-        .collect();
-    for _ in 0..3 {
-        app.update(vec![]);
-    }
+    // Rows and the grip share one `Ui`. When the height snaps another row on,
+    // the grip must keep its identity, or the drag is dropped after one row.
+    for (theme, row_height) in [
+        (UiTheme::WinampRedrawn, 13.0),
+        (UiTheme::ClassicWinamp, 13.0),
+        (UiTheme::ModernHifi, 18.0),
+        (UiTheme::CyberpunkTerminal, 14.0),
+    ] {
+        let mut app = OffscreenApp::new(295.0, 560.0);
+        app.app.active_theme = theme;
+        let start = 58.0 + 5.0 * row_height;
+        app.app.playlist_state.height = start;
+        app.app.playlist_state.height_unsnapped = start;
+        app.app.playlist_state.items = (0..10)
+            .map(|index| retroamp::ui::playlist_window::PlaylistEntry {
+                title: format!("Track {index}"),
+                path: std::path::PathBuf::from(format!("track-{index}.wav")),
+                duration_secs: 180,
+            })
+            .collect();
+        for _ in 0..3 {
+            app.update(vec![]);
+        }
 
-    let start = app.app.playlist_state.height;
-    let pos = app.app.playlist_state.position + vec2(120.0, start - 3.0);
-    let button = |pos, pressed| Event::PointerButton {
-        pos,
-        button: PointerButton::Primary,
-        pressed,
-        modifiers: Modifiers::NONE,
-    };
-    app.update(vec![Event::PointerMoved(pos), button(pos, true)]);
-    for delta in 1..=26 {
-        app.update(vec![Event::PointerMoved(pos + vec2(0.0, delta as f32))]);
-    }
-    app.update(vec![button(pos + vec2(0.0, 26.0), false)]);
+        let pos = app.app.playlist_state.position + vec2(120.0, start - 3.0);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        app.update(vec![Event::PointerMoved(pos), button(pos, true)]);
+        let distance = (2.0 * row_height) as i32;
+        for delta in 1..=distance {
+            app.update(vec![Event::PointerMoved(pos + vec2(0.0, delta as f32))]);
+        }
+        app.update(vec![button(pos + vec2(0.0, distance as f32), false)]);
 
-    assert_eq!(app.app.playlist_state.height, start + 26.0);
+        assert_eq!(
+            app.app.playlist_state.height,
+            start + 2.0 * row_height,
+            "a drag past two row boundaries should add two rows in {theme:?}"
+        );
+    }
 }
 
 #[test]
@@ -471,4 +491,116 @@ fn failed_track_attempt_shows_the_title_and_recovery_step() {
     let message = app.app.playback_error.as_deref().unwrap();
     assert!(message.contains("Unavailable test fixture"));
     assert!(message.contains("open a different file"));
+
+    // The default host is only 295pt wide; the notice must fit inside it
+    // instead of being centred on it and clipped on both sides.
+    for _ in 0..3 {
+        app.update(vec![]);
+    }
+    let notice = app
+        .area("retroamp-playback-error")
+        .expect("the failure must be reported on screen");
+    assert!(
+        app.bounds.contains_rect(notice),
+        "notice {notice:?} is clipped by {:?}",
+        app.bounds
+    );
+}
+
+#[test]
+fn refused_skin_is_reported_on_screen_and_a_good_one_clears_the_notice() {
+    let mut app = OffscreenApp::new(295.0, 362.0);
+    let good = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/skins/matrix.wsz");
+
+    app.app.handle_opened_file("missing.wsz".into());
+    let message = app
+        .app
+        .skin_error
+        .as_deref()
+        .expect("a refused skin must be reported, not only logged");
+    assert!(message.contains("missing.wsz"), "{message}");
+
+    for _ in 0..3 {
+        app.update(vec![]);
+    }
+    let notice = app
+        .area("retroamp-skin-error")
+        .expect("the refused skin must be reported on screen");
+    assert!(
+        app.bounds.contains_rect(notice),
+        "notice {notice:?} is clipped by {:?}",
+        app.bounds
+    );
+
+    app.app.handle_opened_file(good);
+    assert_eq!(app.app.skin_error, None, "loading a skin clears the notice");
+}
+
+/// The menu is a modal (focus stays inside it) but it must still open as a
+/// dropdown under the titlebar logo, not over the centre of the player.
+#[test]
+fn menu_drops_down_under_the_titlebar_logo() {
+    let mut app = OffscreenApp::new(295.0, 362.0);
+    app.press_key(egui::Key::F10);
+    for _ in 0..3 {
+        app.update(vec![]);
+    }
+    let menu = app
+        .area("retroamp-main-menu")
+        .expect("menu popup must be allocated");
+    let expected = app.app.main_state.position + vec2(8.0, 20.0);
+    assert_eq!(menu.min, expected, "the menu should open at the dropdown anchor");
+    // Focus is still trapped by the modal: Tab never leaves it.
+    app.press_key(egui::Key::Tab);
+    assert!(app.app.main_state.menu_open);
+}
+
+#[test]
+fn failed_config_saves_back_off_instead_of_retrying_forever() {
+    let mut app = OffscreenApp::new(295.0, 362.0);
+    // A regular file where the config directory should be: creating it fails.
+    let blocker = std::env::temp_dir().join(format!(
+        "retroamp-config-blocker-{}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&blocker, b"not a directory").unwrap();
+
+    let _lock = APP_INIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = ScopedEnv::new(vec![(
+        "XDG_CONFIG_HOME",
+        Some(blocker.clone().into_os_string()),
+    )]);
+    app.pin_last_save = false;
+    app.app.config_dirty = true;
+
+    let mut delays = Vec::new();
+    for _ in 0..12 {
+        // Long past the due time, so every frame attempts a save and fails.
+        app.app.last_config_save = std::time::Instant::now() - std::time::Duration::from_secs(600);
+        delays.push(OffscreenApp::repaint_delay(&app.update_output(vec![])));
+    }
+    assert!(app.app.config_dirty, "the settings are still unsaved");
+    assert_eq!(
+        app.app.config_save_interval,
+        std::time::Duration::from_secs(60),
+        "each failure should double the wait, capped at a minute"
+    );
+    assert!(
+        delays[11] >= std::time::Duration::from_secs(50),
+        "an idle UI with an unwritable config should sleep, not wake at the save rate; got {:?}",
+        delays
+    );
+
+    // Once the location is writable again the normal cadence returns.
+    std::fs::remove_file(&blocker).unwrap();
+    app.app.last_config_save = std::time::Instant::now() - std::time::Duration::from_secs(600);
+    app.update(vec![]);
+    assert!(!app.app.config_dirty, "a successful save clears the dirty flag");
+    assert_eq!(app.app.config_save_interval, std::time::Duration::from_millis(800));
+
+    drop(_env);
+    drop(_lock);
+    let _ = std::fs::remove_dir_all(&blocker);
 }

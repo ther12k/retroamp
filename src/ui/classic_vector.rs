@@ -601,7 +601,13 @@ pub fn render_vector_playlist(
         pos + Vec2::new(13.0, state.height - 7.0),
         pos + Vec2::new(PL_DEFAULT_WIDTH - 21.0, state.height),
     );
-    let grip_resp = ui.allocate_rect(grip, Sense::drag());
+    // A stable id: an auto id shifts whenever a snapped-on row is allocated
+    // ahead of the grip, which would drop an in-progress drag.
+    let grip_resp = ui.interact(
+        grip,
+        ui.make_persistent_id("playlist-resize-grip"),
+        Sense::drag(),
+    );
     state.resize_from_grip(&grip_resp, 13.0);
 
     action

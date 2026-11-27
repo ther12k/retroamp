@@ -29,6 +29,28 @@ fn test_skin_loader_safety_and_validation() {
     assert_eq!(skin.main.size, [275, 116]);
 }
 
+/// Every skin shipped in the repository has to clear the same strict loader a
+/// user's dropped `.wsz` goes through; otherwise a bundled skin is unusable.
+#[test]
+fn every_bundled_skin_passes_the_loader() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/skins");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("bundled skins directory") {
+        let path = entry.expect("directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wsz") {
+            continue;
+        }
+        let skin = Skin::load_wsz(&path)
+            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let expected = path.file_stem().unwrap().to_string_lossy();
+        assert_eq!(skin.name, expected, "{}", path.display());
+        assert_eq!(skin.main.size, [275, 116], "{}", path.display());
+        assert_eq!(skin.eqmain.size, [275, 315], "{}", path.display());
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "the four bundled skins must all be present");
+}
+
 #[test]
 fn test_skin_image_dimension_limit() {
     for (width, accepted) in [(2048, true), (2049, false)] {

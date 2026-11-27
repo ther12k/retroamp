@@ -16,7 +16,7 @@
   - 🟢 **Cyberpunk Terminal**: Neon phosphor green & cyan CRT glow for Linux hacker workstations.
   - 📻 **Hi-Fi Studio**: Audiophile brushed aluminum with amber vacuum-fluorescent display.
   - ❄️ **Nord Frost**: Slate polar blue and pastel ice tones that blend with modern Linux desktop environments.
-  - 🎨 **Skin Selector Drawer**: Press `S` anytime to switch themes instantly, or drop any custom `.wsz` file onto the window.
+  - 🎨 **Skin Selector Drawer**: Press `S` to switch themes instantly, or drop any custom `.wsz` file onto the window. A skin that cannot be loaded is reported in a notice; nothing is applied silently.
 - **Classic Main Menu** (`☰` in the titlebar, or click the logo in Classic theme): File / Playback (with Shuffle & Repeat) / View (EQ, Playlist, Double Size, Zoom) / Themes / Help — with an About dialog.
 - **Clean-Room Implementation in Pure Rust**: Built with safe Rust using `egui`/`eframe` with hardware-accelerated immediate-mode GUI rendering.
 - **Native Borderless & Transparent Chrome**:
@@ -55,6 +55,12 @@
 | `Ctrl+D` | Toggle Double Size (2.0× scale) |
 | `Ctrl+=` / `Ctrl+-` | Zoom in / out (1.0×–3.0×) |
 | `Ctrl+0` | Reset zoom to 1.0× |
+
+All shortcuts except `F10` are ignored while the main menu, the EQ preset list, the skin picker or the About dialog is open; close it first (`Esc`).
+
+### Desktop requirements
+
+Opening files and skins goes through the XDG desktop portal: install `xdg-desktop-portal` and a frontend such as `xdg-desktop-portal-gtk` or `xdg-desktop-portal-gnome`. On a desktop without it, the Open dialog cannot appear; audio files can still be dragged onto the window. A track or skin that cannot be read is reported in a notice at the bottom of the window.
 
 ---
 
