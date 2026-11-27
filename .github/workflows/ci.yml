@@ -54,8 +54,9 @@ jobs:
         if: steps.detect.outputs.present == 'true'
         run: |
           # See the note in the `test` job about the Microsoft repo 403s.
+          # The X11 libraries are link-time requirements of the GPUI frontend.
           sudo apt-get update || echo "apt-get update had failures; continuing"
-          sudo apt-get install --no-install-recommends -y build-essential pkg-config libasound2-dev libfontconfig1-dev
+          sudo apt-get install --no-install-recommends -y build-essential pkg-config libasound2-dev libfontconfig1-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
 
       - name: Install Rust
         if: steps.detect.outputs.present == 'true'
