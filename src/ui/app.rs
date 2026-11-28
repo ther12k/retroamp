@@ -122,6 +122,10 @@ pub struct WinampApp {
     /// How long to wait before saving a dirty config. Doubles after each failed
     /// save, so an unwritable config location cannot keep an idle UI awake.
     pub config_save_interval: Duration,
+    /// Playlist duration scanner: jobs go out, (path, seconds) come back.
+    /// Both stay None until the first track is queued for scanning.
+    duration_jobs: Option<std::sync::mpsc::Sender<PathBuf>>,
+    duration_results: Option<std::sync::mpsc::Receiver<(PathBuf, u64)>>,
 }
 
 /// Colors so popup dialogs blend with the active theme's look.
@@ -351,7 +355,52 @@ impl WinampApp {
             config_dirty: false,
             last_config_save: Instant::now(),
             config_save_interval: MIN_CONFIG_SAVE_INTERVAL,
+            duration_jobs: None,
+            duration_results: None,
         }
+    }
+
+    /// Start the one-shot duration scanner thread if it is not running. It
+    /// probes one queued path at a time and reports back; when the UI drops
+    /// its end of the channels the thread finishes after the current probe.
+    fn ensure_duration_scanner(&mut self) {
+        if self.duration_jobs.is_some() {
+            return;
+        }
+        let (jobs, job_receiver) = std::sync::mpsc::channel::<PathBuf>();
+        let (results, result_receiver) = std::sync::mpsc::channel::<(PathBuf, u64)>();
+        let spawned = std::thread::Builder::new()
+            .name("retroamp-duration-scan".into())
+            .spawn(move || {
+                while let Ok(path) = job_receiver.recv() {
+                    if let Some(duration) = crate::audio::probe_duration(&path) {
+                        let _ = results.send((path, duration.as_secs()));
+                    }
+                }
+            })
+            .is_ok();
+        if spawned {
+            self.duration_jobs = Some(jobs);
+            self.duration_results = Some(result_receiver);
+        }
+    }
+
+    /// Apply whatever durations came back. Entries are matched by path, so a
+    /// playlist edit between scan start and finish cannot misplace a duration.
+    /// Returns true when something changed (the UI may need one more frame).
+    fn drain_duration_results(&mut self) -> bool {
+        let mut updated = false;
+        if let Some(receiver) = &self.duration_results {
+            while let Ok((path, seconds)) = receiver.try_recv() {
+                for entry in &mut self.playlist_state.items {
+                    if entry.path == path && entry.duration_secs == 0 {
+                        entry.duration_secs = seconds;
+                        updated = true;
+                    }
+                }
+            }
+        }
+        updated
     }
 
     /// Snapshot of every user-adjustable setting that gets persisted.
@@ -533,7 +582,8 @@ impl WinampApp {
         dismiss
     }
 
-    /// Add a track to the playlist without touching playback.
+    /// Add a track to the playlist without touching playback, and queue its
+    /// duration for a background probe so rows never sit at 00:00.
     fn add_track(&mut self, path: PathBuf) -> usize {
         let title = path
             .file_stem()
@@ -546,6 +596,10 @@ impl WinampApp {
             path: path.clone(),
             duration_secs: 0,
         });
+        self.ensure_duration_scanner();
+        if let Some(jobs) = &self.duration_jobs {
+            let _ = jobs.send(path);
+        }
         index
     }
 
@@ -1409,6 +1463,7 @@ impl App for WinampApp {
             self.last_config_save = Instant::now();
         }
 
+        let durations_arrived = self.drain_duration_results();
         let mut repaint_after = None::<Duration>;
         if ctx.input(|input| !input.raw.events.is_empty()) {
             // Some custom-rendered controls apply their action after painting.
@@ -1421,6 +1476,10 @@ impl App for WinampApp {
         if (self.main_state.menu_open && self.main_state.menu_frames <= 2)
             || (self.eq_state.show_presets && self.eq_state.presets_frames <= 2)
         {
+            repaint_after = Some(Duration::from_millis(16));
+        }
+        if durations_arrived {
+            // Fresh row durations are user-visible state; one prompt frame.
             repaint_after = Some(Duration::from_millis(16));
         }
         if self.config_dirty {

@@ -527,6 +527,18 @@ fn decode_guarded<T>(context: &str, run: impl FnOnce() -> Result<T, String>) -> 
     }
 }
 
+/// Duration of an audio file, for playlist rows that have not been played yet.
+/// Probing opens and parses the header, so callers keep it off the UI thread.
+pub fn probe_duration(path: &Path) -> Option<Duration> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        extract_metadata(path).ok().map(|metadata| metadata.duration)
+    }));
+    match result {
+        Ok(Some(duration)) if duration > Duration::ZERO => Some(duration),
+        _ => None,
+    }
+}
+
 /// Helper: Extract ID3 and format metadata from audio file
 fn extract_metadata(path: &Path) -> Result<TrackMetadata, String> {
     decode_guarded("Unable to read audio metadata", || read_metadata(path))
@@ -1056,6 +1068,17 @@ mod framing_tests {
 
     /// Symphonia's RIFF reader panics on a zero sample rate. It must surface as
     /// an ordinary playback error, before any output device is opened.
+    #[test]
+    fn probe_duration_reads_a_valid_wav_header() {
+        // The shared framing fixture at 44100 Hz: half a second per 22050 frames.
+        let path = std::env::temp_dir().join(format!("retroamp-probe-{}.wav", std::process::id()));
+        std::fs::write(&path, wav(1, 22050)).unwrap();
+        let duration = probe_duration(&path);
+        let _ = std::fs::remove_file(&path);
+        let duration = duration.expect("a valid WAV must yield its duration");
+        assert!((duration.as_secs_f32() - 0.5).abs() < 0.01, "{duration:?}");
+    }
+
     #[test]
     fn a_zero_sample_rate_header_is_an_error_not_a_crash() {
         let mut bytes = wav(1, 64);

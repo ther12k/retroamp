@@ -539,6 +539,72 @@ fn refused_skin_is_reported_on_screen_and_a_good_one_clears_the_notice() {
 /// The menu is a modal (focus stays inside it) but it must still open as a
 /// dropdown under the titlebar logo, not over the centre of the player.
 #[test]
+fn queued_tracks_get_real_durations_without_blocking_the_ui() {
+    // A 2-second WAV whose header the scanner reads without any audio device.
+    let dir = std::env::temp_dir().join(format!(
+        "retroamp-duration-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rate: u32 = 8000; // small on purpose: the probe reads the header only
+    let path = dir.join("two-seconds.wav");
+    let frames = 2 * rate as usize;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    // u32 sizes: `frames` is a usize, whose 8-byte `to_le_bytes` would
+    // shift the whole header by four zero bytes.
+    bytes.extend_from_slice(&((36 + frames * 2) as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16u32.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+    bytes.extend_from_slice(&rate.to_le_bytes());
+    bytes.extend_from_slice(&(rate * 2).to_le_bytes());
+    bytes.extend_from_slice(&2u16.to_le_bytes());
+    bytes.extend_from_slice(&16u16.to_le_bytes());
+    // The header claims two seconds of PCM, but the data chunk is empty:
+    // the scanner can still read the duration from the header, while the
+    // player fails at priming before any audio device is touched. That
+    // keeps the test hermetic and exercises the scan, not the play path.
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&((frames * 2) as u32).to_le_bytes());
+    // …and stop here: no samples follow the data header.
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut app = OffscreenApp::new(295.0, 362.0);
+    app.app.open_paths(&[path.clone()]);
+    assert_eq!(app.app.playlist_state.items.len(), 1);
+    assert_eq!(app.app.playlist_state.items[0].duration_secs, 0);
+    assert!(
+        app.app.playback_error.is_some(),
+        "the unplayable entry must be reported instead of silently queued"
+    );
+
+    // The probe runs on a worker thread; idle frames pick the result up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut delay = std::time::Duration::ZERO;
+    while app.app.playlist_state.items[0].duration_secs == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the scanned duration never arrived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        delay = OffscreenApp::repaint_delay(&app.update_output(vec![]));
+    }
+    assert_eq!(app.app.playlist_state.items[0].duration_secs, 2);
+    assert!(
+        delay <= std::time::Duration::from_millis(33),
+        "a frame that applied a duration should prompt the next one; got {delay:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn command_line_arguments_fill_the_playlist_and_report_failures() {
     // Garbage content keeps this hermetic: metadata fails before any audio
     // device is touched.
