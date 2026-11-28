@@ -76,6 +76,20 @@ struct Player {
     load_generation: u64,
     load_cancel: Option<Arc<AtomicBool>>,
     error: Option<String>,
+    /// Tracks one auto-advance chain: the titles it skipped and the row the
+    /// chain started from, so a fully failed chain reports itself and puts
+    /// the selection back instead of leaving it on the last broken entry.
+    skipped: Vec<String>,
+    chain_origin: Option<usize>,
+}
+
+/// One auto-advance chain that ran out of playable tracks. A single failure
+/// reads like the old message; several failures list everything it tried.
+fn chain_failure_message(skipped: &[String], error: &str) -> String {
+    match skipped {
+        [only] => format!("Can't play {only}: {error}"),
+        names => format!("Skipped unplayable tracks ({}): {error}", names.join(", ")),
+    }
 }
 
 impl Player {
@@ -96,6 +110,8 @@ impl Player {
             load_generation: 0,
             load_cancel: None,
             error: None,
+            skipped: Vec::new(),
+            chain_origin: None,
         };
         if !player.queue.files.is_empty() {
             player.start(0, cx, false);
@@ -112,6 +128,16 @@ impl Player {
     }
 
     fn start(&mut self, index: usize, cx: &mut Context<Self>, auto_advance: bool) {
+        // A manual start abandons any chain in progress; an auto-advance that
+        // begins one remembers where it started so a fully failed chain can
+        // restore the selection there.
+        if auto_advance {
+            self.chain_origin.get_or_insert(self.queue.current.unwrap_or(index));
+        } else {
+            self.skipped.clear();
+            self.chain_origin = None;
+        }
+
         let Some(path) = self.queue.select(index).map(Path::to_path_buf) else {
             return;
         };
@@ -154,12 +180,36 @@ impl Player {
                         loaded_audio.set_balance(player.audio.balance);
                         loaded_audio.update_eq(player.audio.eq);
                         player.audio = loaded_audio;
-                        player.error = None;
+                        player.error = if player.skipped.is_empty() {
+                            None
+                        } else {
+                            Some(format!(
+                                "Skipped unplayable tracks: {}",
+                                player.skipped.join(", ")
+                            ))
+                        };
+                        player.skipped.clear();
+                        player.chain_origin = None;
                     }
                     Err(error) => {
-                        player.error = Some(format!("Can't play {}: {error}", file_name(&path)));
+                        player.skipped.push(file_name(&path));
                         if auto_advance && let Some(next) = player.queue.neighbor(1) {
                             player.start(next, cx, true);
+                        } else {
+                            // The chain is out of tracks: report every skipped
+                            // title and put the selection back where the chain
+                            // began, so Play retries the origin, not the last
+                            // broken entry.
+                            player.error =
+                                Some(chain_failure_message(&player.skipped, &error));
+                            if let Some(origin) = player.chain_origin {
+                                player.queue.current = Some(origin);
+                                player
+                                    .scroll
+                                    .scroll_to_item(origin, ScrollStrategy::Center);
+                            }
+                            player.skipped.clear();
+                            player.chain_origin = None;
                         }
                     }
                 }
@@ -372,6 +422,11 @@ impl Render for Player {
         let duration = track
             .map(|t| clock(t.duration))
             .unwrap_or_else(|| "--:--".into());
+        // The engine plays the sink buffer out past the header duration, so
+        // the shown elapsed time must never run past the end.
+        let position = track
+            .map(|t| self.audio.position.min(t.duration))
+            .unwrap_or(self.audio.position);
         let play_label = if self.loading {
             "Loading…"
         } else {
@@ -441,7 +496,7 @@ impl Render for Player {
                             .child(
                                 div()
                                     .font_family("monospace")
-                                    .child(format!("{} / {duration}", clock(self.audio.position))),
+                                    .child(format!("{} / {duration}", clock(position))),
                             ),
                     )
                     .child(div().text_lg().truncate().child(title))
@@ -650,5 +705,21 @@ mod tests {
         assert!(queue.select(2).is_none());
         assert_eq!(queue.current, Some(1));
         assert_eq!(queue.neighbor(-1), Some(0));
+    }
+
+    #[test]
+    fn a_single_chain_failure_names_the_track_and_reason() {
+        let message = chain_failure_message(&["a.wav".into()], "the decoder rejected the file");
+        assert_eq!(message, "Can't play a.wav: the decoder rejected the file");
+    }
+
+    #[test]
+    fn an_exhausted_chain_lists_every_skipped_title() {
+        let message = chain_failure_message(
+            &["a.wav".into(), "b.wav".into(), "c.wav".into()],
+            "No audio output device available",
+        );
+        assert!(message.starts_with("Skipped unplayable tracks (a.wav, b.wav, c.wav):"), "{message}");
+        assert!(message.ends_with("No audio output device available"));
     }
 }
