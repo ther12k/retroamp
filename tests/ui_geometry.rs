@@ -415,7 +415,17 @@ fn eof_auto_advance_stops_after_failed_entries_without_changing_manual_index() {
 
     app.app.play_next_auto();
 
-    assert_eq!(app.app.current_track_index, Some(0));
+    // The chain walks background loads: it ends when nothing is pending.
+    assert!(
+        run_until(
+            &mut app,
+            |app| (app.pending_load.is_none(), app.playback_error.is_some()),
+            |(no_pending, error)| no_pending && error,
+            std::time::Duration::from_secs(5)
+        ),
+        "the exhausted chain must settle on an error"
+    );
+    assert_eq!(app.app.current_track_index, Some(0), "the selection returns to the chain origin");
     assert_eq!(app.app.audio.state, retroamp::audio::PlaybackState::Stopped);
 }
 
@@ -495,6 +505,27 @@ fn idle_ui_sleeps_and_playback_requests_a_steady_refresh() {
     );
 }
 
+/// Run idle frames until a copyable snapshot of the app satisfies `done`.
+/// Worker threads deliver load outcomes and scan results between frames.
+fn run_until<R: Copy>(
+    app: &mut OffscreenApp,
+    snapshot: impl Fn(&WinampApp) -> R,
+    done: impl Fn(R) -> bool,
+    limit: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if done(snapshot(&app.app)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        app.update_output(vec![]);
+    }
+}
+
 #[test]
 fn failed_track_attempt_shows_the_title_and_recovery_step() {
     let mut app = OffscreenApp::new(295.0, 362.0);
@@ -507,7 +538,19 @@ fn failed_track_attempt_shows_the_title_and_recovery_step() {
         duration_secs: 0,
     }];
 
-    assert!(!app.app.play_track_index(0));
+    assert!(
+        app.app.play_track_index(0),
+        "a failed load is still a kicked load"
+    );
+    assert!(
+        run_until(
+            &mut app,
+            |app| app.playback_error.is_some(),
+            |reported| reported,
+            std::time::Duration::from_secs(5)
+        ),
+        "the background failure must surface in a notice"
+    );
     let message = app.app.playback_error.as_deref().unwrap();
     assert!(message.contains("Unavailable test fixture"));
     assert!(message.contains("open a different file"));
@@ -599,10 +642,6 @@ fn queued_tracks_get_real_durations_without_blocking_the_ui() {
     app.app.open_paths(&[path.clone()]);
     assert_eq!(app.app.playlist_state.items.len(), 1);
     assert_eq!(app.app.playlist_state.items[0].duration_secs, 0);
-    assert!(
-        app.app.playback_error.is_some(),
-        "the unplayable entry must be reported instead of silently queued"
-    );
 
     // The probe runs on a worker thread; idle frames pick the result up.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -619,6 +658,17 @@ fn queued_tracks_get_real_durations_without_blocking_the_ui() {
     assert!(
         delay <= std::time::Duration::from_millis(33),
         "a frame that applied a duration should prompt the next one; got {delay:?}"
+    );
+
+    // Playback priming runs in the background and reports its failure once settled.
+    assert!(
+        run_until(
+            &mut app,
+            |app| app.playback_error.is_some(),
+            |reported| reported,
+            std::time::Duration::from_secs(5),
+        ),
+        "the unplayable entry must be reported instead of silently queued"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -655,11 +705,16 @@ fn command_line_arguments_fill_the_playlist_and_report_failures() {
         vec!["alpha", "zeta"],
         "folder tracks join sorted; non-audio files are skipped"
     );
-    let error = app
-        .app
-        .playback_error
-        .as_deref()
-        .expect("the first unplayable track is reported");
+    assert!(
+        run_until(
+            &mut app,
+            |app| app.playback_error.is_some(),
+            |reported| reported,
+            std::time::Duration::from_secs(5)
+        ),
+        "the first unplayable track must be reported"
+    );
+    let error = app.app.playback_error.as_deref().unwrap();
     assert!(error.contains("alpha"), "{error}");
     let skin_error = app
         .app

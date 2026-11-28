@@ -14,6 +14,8 @@ use crate::ui::textures::SkinTextures;
 use eframe::App;
 use egui::{Color32, Context, Key};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,25 +73,51 @@ fn is_audio_path(path: &Path) -> bool {
         })
 }
 
-fn try_auto_advance(
+/// The next index an EOF auto-advance should try: sequential past the origin
+/// without wrapping, or a random one under shuffle. Each entry is tried once
+/// per chain, so a playlist full of broken files cannot loop forever.
+fn next_advance_candidate(
     item_count: usize,
-    current_index: Option<usize>,
+    origin: Option<usize>,
+    attempted: &[usize],
     shuffle: bool,
-    mut try_play: impl FnMut(usize) -> bool,
 ) -> Option<usize> {
-    let mut candidates: Vec<usize> = if shuffle {
-        (0..item_count).collect()
-    } else {
-        (current_index.map_or(0, |index| index.saturating_add(1))..item_count).collect()
-    };
-
-    if shuffle {
-        fastrand::shuffle(&mut candidates);
+    if item_count == 0 {
+        return None;
     }
+    if shuffle {
+        let mut candidates: Vec<usize> = (0..item_count).collect();
+        fastrand::shuffle(&mut candidates);
+        candidates
+            .into_iter()
+            .find(|index| !attempted.contains(index))
+    } else {
+        let start = origin.map_or(0, |index| index.saturating_add(1));
+        (start..item_count).find(|index| !attempted.contains(index))
+    }
+}
 
-    candidates
-        .into_iter()
-        .find(|&index| try_play(index))
+/// One EOF auto-advance chain: the row it started from and every index it has
+/// tried, so an exhausted chain can restore the selection to its origin.
+#[derive(Clone)]
+struct AdvanceChain {
+    origin: usize,
+    attempted: Vec<usize>,
+}
+
+/// A track load running on a worker thread. The UI holds a standby engine
+/// until the outcome arrives, exactly like the GPUI frontend.
+enum LoadOutcome {
+    Loaded(AudioEngine),
+    Failed(String),
+}
+
+pub struct PendingLoad {
+    index: usize,
+    title: String,
+    chain: Option<AdvanceChain>,
+    cancel: Arc<AtomicBool>,
+    result: std::sync::mpsc::Receiver<LoadOutcome>,
 }
 
 pub struct WinampApp {
@@ -126,6 +154,21 @@ pub struct WinampApp {
     /// Both stay None until the first track is queued for scanning.
     duration_jobs: Option<std::sync::mpsc::Sender<PathBuf>>,
     duration_results: Option<std::sync::mpsc::Receiver<(PathBuf, u64)>>,
+    /// A track load decoding on a worker thread, with the standby engine
+    /// standing in on the UI side until its outcome arrives.
+    pub pending_load: Option<PendingLoad>,
+    /// Monotonic counter; bumping it invalidates any load kicked before.
+    pub load_generation: u64,
+}
+
+impl Drop for WinampApp {
+    fn drop(&mut self) {
+        // The worker checks this token between decode steps; the process is
+        // on its way out, but release it properly anyway.
+        if let Some(pending) = self.pending_load.take() {
+            pending.cancel.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Colors so popup dialogs blend with the active theme's look.
@@ -357,6 +400,144 @@ impl WinampApp {
             config_save_interval: MIN_CONFIG_SAVE_INTERVAL,
             duration_jobs: None,
             duration_results: None,
+            pending_load: None,
+            load_generation: 0,
+        }
+    }
+
+    /// Queue `index` for playback on a worker thread and immediately return:
+    /// the UI never blocks on decoding. A standby engine (with the user's
+    /// volume, balance and EQ) answers until the outcome lands. `chain`
+    /// marks the load as part of an EOF auto-advance chain.
+    fn request_play(&mut self, index: usize, chain: Option<AdvanceChain>) -> bool {
+        if index >= self.playlist_state.items.len() {
+            return false;
+        }
+        let path = self.playlist_state.items[index].path.clone();
+        let title = self.playlist_state.items[index].title.clone();
+
+        // A newer request invalidates everything in flight.
+        self.load_generation += 1;
+        if let Some(pending) = self.pending_load.take() {
+            pending.cancel.store(true, Ordering::SeqCst);
+        }
+
+        // Swap the playing engine out to the worker; the standby keeps the
+        // controls live. On adoption the loaded engine takes the standby's
+        // settings back, so nothing changed meanwhile is lost.
+        let mut loading = std::mem::replace(&mut self.audio, AudioEngine::new());
+        let mut standby = AudioEngine::new();
+        standby.set_volume(loading.volume);
+        standby.set_balance(loading.balance);
+        standby.update_eq(loading.eq);
+        self.audio = standby;
+
+        self.current_track_index = Some(index);
+        self.playlist_state.selected_index = Some(index);
+        self.playback_error = None;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (result_tx, result_rx) = std::sync::mpsc::channel::<LoadOutcome>();
+        let worker_cancel = cancel.clone();
+        let spawned = std::thread::Builder::new()
+            .name("retroamp-track-load".into())
+            .spawn(move || {
+                let outcome = match loading.play_file_with_cancellation(&path, &worker_cancel) {
+                    Ok(()) => LoadOutcome::Loaded(loading),
+                    Err(error) => LoadOutcome::Failed(error),
+                };
+                let _ = result_tx.send(outcome);
+            })
+            .is_ok();
+        if spawned {
+            self.pending_load = Some(PendingLoad {
+                index,
+                title,
+                chain,
+                cancel,
+                result: result_rx,
+            });
+        } else {
+            self.playback_error = Some(format!(
+                "Unable to play ‘{title}’: the load could not be started. Choose another track."
+            ));
+        }
+        spawned
+    }
+
+    /// Cancel any load in flight and stop the standby engine.
+    fn stop_playback(&mut self) {
+        self.load_generation += 1;
+        if let Some(pending) = self.pending_load.take() {
+            pending.cancel.store(true, Ordering::SeqCst);
+        }
+        self.audio.stop();
+    }
+
+    /// Adopt a finished load, or report the failure and keep an EOF chain
+    /// walking. Called with the pending load taken.
+    fn finish_load(&mut self, pending: PendingLoad, outcome: LoadOutcome) {
+        match outcome {
+            LoadOutcome::Loaded(mut loaded) => {
+                loaded.set_volume(self.audio.volume);
+                loaded.set_balance(self.audio.balance);
+                loaded.update_eq(self.audio.eq);
+                self.audio = loaded;
+                self.playback_error = None;
+                if let Some(track) = self.audio.current_track.as_ref()
+                    && let Some(entry) = self.playlist_state.items.get_mut(pending.index)
+                {
+                    entry.duration_secs = track.duration.as_secs();
+                }
+            }
+            LoadOutcome::Failed(error) => {
+                log::error!(
+                    "Error playing audio file {:?}: {error}",
+                    self.playlist_state.items.get(pending.index).map(|e| &e.path)
+                );
+                self.playback_error = Some(format!(
+                    "Unable to play ‘{}’: {error}. Choose another track or open a different file.",
+                    pending.title
+                ));
+                if let Some(chain) = pending.chain {
+                    let shuffle = self.main_state.shuffle;
+                    match next_advance_candidate(
+                        self.playlist_state.items.len(),
+                        Some(chain.origin),
+                        &chain.attempted,
+                        shuffle,
+                    ) {
+                        Some(next) => {
+                            let mut attempted = chain.attempted;
+                            attempted.push(next);
+                            self.request_play(
+                                next,
+                                Some(AdvanceChain {
+                                    origin: chain.origin,
+                                    attempted,
+                                }),
+                            );
+                        }
+                        None => {
+                            // Out of entries: return the selection to where the
+                            // chain began so Play retries it, not a broken row.
+                            self.audio.stop();
+                            self.current_track_index = Some(chain.origin);
+                            self.playlist_state.selected_index = Some(chain.origin);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain the load outcome, if it has arrived.
+    fn poll_pending_load(&mut self) {
+        if let Some(pending) = self.pending_load.as_ref()
+            && let Ok(outcome) = pending.result.try_recv()
+        {
+            let pending = self.pending_load.take().expect("just borrowed");
+            self.finish_load(pending, outcome);
         }
     }
 
@@ -419,31 +600,11 @@ impl WinampApp {
         }
     }
 
+    /// Start playing `index`. Returns false only when the index is out of
+    /// range or the load could not be kicked; the load itself completes in
+    /// the background and its outcome is applied on a later frame.
     pub fn play_track_index(&mut self, index: usize) -> bool {
-        if index >= self.playlist_state.items.len() {
-            return false;
-        }
-
-        let path = self.playlist_state.items[index].path.clone();
-        match self.audio.play_file(&path) {
-            Ok(()) => {
-                self.current_track_index = Some(index);
-                self.playlist_state.selected_index = Some(index);
-                self.playback_error = None;
-                if let Some(ref track) = self.audio.current_track {
-                    self.playlist_state.items[index].duration_secs = track.duration.as_secs();
-                }
-                true
-            }
-            Err(e) => {
-                log::error!("Error playing audio file {}: {e}", path.display());
-                let title = self.playlist_state.items[index].title.clone();
-                self.playback_error = Some(format!(
-                    "Unable to play ‘{title}’: {e}. Choose another track or open a different file."
-                ));
-                false
-            }
-        }
+        self.request_play(index, None)
     }
 
     pub fn play_next(&mut self) {
@@ -464,16 +625,24 @@ impl WinampApp {
 
     /// Auto-advance at end of track (EOF). Unlike manual Next — which wraps
     /// around like Winamp — this stops at the end of the playlist unless
-    /// repeat or shuffle is on. Unplayable entries are skipped once per pass.
+    /// repeat or shuffle is on. Broken entries are skipped once per chain:
+    /// each failed background load advances the chain until something plays
+    /// or the queue is exhausted, at which point the selection returns to the
+    /// row the chain started from.
     pub fn play_next_auto(&mut self) {
-        let next = try_auto_advance(
-            self.playlist_state.items.len(),
-            self.current_track_index,
-            self.main_state.shuffle,
-            |index| self.play_track_index(index),
-        );
-        if next.is_none() {
-            self.audio.stop();
+        let origin = self.current_track_index;
+        let shuffle = self.main_state.shuffle;
+        match next_advance_candidate(self.playlist_state.items.len(), origin, &[], shuffle) {
+            Some(next) => {
+                self.request_play(
+                    next,
+                    Some(AdvanceChain {
+                        origin: origin.unwrap_or(next),
+                        attempted: vec![next],
+                    }),
+                );
+            }
+            None => self.stop_playback(),
         }
     }
 
@@ -794,7 +963,8 @@ impl WinampApp {
             self.ui_scale = new_scale;
         }
         if do_prev { self.play_prev(); }
-        if do_play {
+        if do_play && self.pending_load.is_none() {
+            // No row selected: mirror Winamp and start the first one.
             if let Some(idx) = self.current_track_index {
                 self.play_track_index(idx);
             } else if !self.playlist_state.items.is_empty() {
@@ -808,7 +978,7 @@ impl WinampApp {
                 self.audio.resume();
             }
         }
-        if do_stop { self.audio.stop(); }
+        if do_stop { self.stop_playback(); }
         if do_next { self.play_next(); }
         if do_open { self.open_file_dialog(); }
         if vol_delta != 0.0 {
@@ -841,14 +1011,28 @@ impl App for WinampApp {
         }
 
         // Update audio engine (positions, FFT calculation)
+        // Adopt a finished background load before anything else: the outcome
+        // may start or stop playback, which changes what update() reports.
+        self.poll_pending_load();
         let track_finished = self.audio.update();
         if track_finished {
             if self.main_state.repeat {
-                let restarted = self
-                    .current_track_index
-                    .is_some_and(|index| self.play_track_index(index));
-                if !restarted {
-                    self.play_next_auto();
+                // Replay the finished row; if it turns out broken, the chain
+                // skips onward instead of retrying the same entry forever.
+                let origin = self.current_track_index;
+                match origin
+                    .filter(|&index| index < self.playlist_state.items.len())
+                    .map(|index| {
+                        self.request_play(
+                            index,
+                            Some(AdvanceChain {
+                                origin: index,
+                                attempted: vec![index],
+                            }),
+                        )
+                    }) {
+                    Some(true) => {}
+                    _ => self.play_next_auto(),
                 }
             } else {
                 self.play_next_auto();
@@ -1266,7 +1450,7 @@ impl App for WinampApp {
                 }
             }
             MainAction::Stop => {
-                self.audio.stop();
+                self.stop_playback();
             }
             MainAction::Prev => self.play_prev(),
             MainAction::Next => self.play_next(),
@@ -1303,7 +1487,7 @@ impl App for WinampApp {
                         // Safely adjust current track index
                         if let Some(curr) = self.current_track_index {
                             if curr == idx {
-                                self.audio.stop();
+                                self.stop_playback();
                                 self.current_track_index = if self.playlist_state.items.is_empty() {
                                     None
                                 } else {
@@ -1499,27 +1683,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_advance_skips_unplayable_entries_once_until_success() {
+    fn auto_advance_candidates_continue_after_the_origin_without_wrapping() {
         let mut attempted = Vec::new();
-        let selected = try_auto_advance(4, Some(0), false, |index| {
-            attempted.push(index);
-            index == 3
-        });
+        let mut current = Some(0);
+        while let Some(next) = next_advance_candidate(4, current, &attempted, false) {
+            attempted.push(next);
+            current = Some(next);
+        }
 
-        assert_eq!(selected, Some(3));
+        // Reaching the end of the playlist ends the chain; it never wraps.
         assert_eq!(attempted, vec![1, 2, 3]);
     }
 
     #[test]
-    fn auto_advance_does_not_wrap_or_retry_an_entry_when_all_fail() {
-        let mut attempted = Vec::new();
-        let selected = try_auto_advance(3, Some(0), false, |index| {
-            attempted.push(index);
-            false
-        });
-
-        assert_eq!(selected, None);
-        assert_eq!(attempted, vec![1, 2]);
+    fn auto_advance_candidates_skip_already_attempted_entries() {
+        assert_eq!(next_advance_candidate(4, Some(0), &[1], false), Some(2));
+        // Every entry tried: the chain is exhausted.
+        assert_eq!(next_advance_candidate(3, Some(0), &[1, 2], false), None);
+        // Under shuffle, the one entry left is the only possible outcome.
+        assert_eq!(next_advance_candidate(3, Some(0), &[0, 1], true), Some(2));
+        assert_eq!(next_advance_candidate(3, Some(0), &[0, 1, 2], true), None);
     }
 
 }
