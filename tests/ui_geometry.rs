@@ -218,24 +218,44 @@ fn menu_rows_can_be_activated_with_tab_and_enter() {
 }
 
 #[test]
-fn tab_focus_wraps_inside_the_open_menu() {
+fn tab_focus_cycles_through_the_open_menu_without_escaping() {
     let mut app = OffscreenApp::new(295.0, 362.0);
     app.press_key(egui::Key::F10);
+    app.press_key(egui::Key::Tab);
 
-    // Cycle through all 21 selectable rows. Focus wraps to the first menu row
-    // rather than escaping to a background control.
-    for _ in 0..21 {
-        app.press_key(egui::Key::Tab);
-    }
-
-    let focused = app
+    let first = app
         .ctx
         .memory(|memory| memory.focused())
-        .expect("an open menu should retain keyboard focus");
+        .expect("an open menu should take keyboard focus");
+
+    // egui hands focus to the next interested widget one frame after Tab, so
+    // crossing the last row shows one frame with nothing focused before the
+    // cycle lands back on the first row. Focus must never stay away longer.
+    let mut blank_frames = 0;
+    let mut wrapped = false;
+    for _ in 0..80 {
+        app.press_key(egui::Key::Tab);
+        match app.ctx.memory(|memory| memory.focused()) {
+            Some(id) if id == first => {
+                wrapped = true;
+                break;
+            }
+            Some(_) => blank_frames = 0,
+            None => {
+                blank_frames += 1;
+                assert!(
+                    blank_frames <= 1,
+                    "Tab focus left the open menu for {blank_frames} frames"
+                );
+            }
+        }
+    }
+    assert!(wrapped, "cycling Tab never returned to the first menu row");
+
     let response = app
         .ctx
-        .read_response(focused)
-        .expect("focused menu row should still be allocated");
+        .read_response(first)
+        .expect("the first menu row should still be allocated");
     assert_eq!(response.layer_id.order, egui::Order::Foreground);
 }
 
